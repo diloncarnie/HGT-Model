@@ -39,6 +39,8 @@ def sample_trajectory(data_points, sampling_interval_ms=1000):
     # points: [(lat, lon, speed, lon_acc, lat_acc, ts), ...]
     pts = []
     last_included_timestamp = None
+    variance = int(sampling_interval_ms * 0.1)
+    current_gap = sampling_interval_ms + np.random.randint(-variance, variance + 1)
     
     for i in range(0, len(data_points)-1, 6):
         try:
@@ -51,9 +53,10 @@ def sample_trajectory(data_points, sampling_interval_ms=1000):
             
             timestamp_ms = int(ts * 1000)
             
-            if last_included_timestamp is None or timestamp_ms - last_included_timestamp >= sampling_interval_ms:
+            if last_included_timestamp is None or timestamp_ms - last_included_timestamp >= current_gap:
                 pts.append([ts, lat, lon, speed, lon_acc, lat_acc])
                 last_included_timestamp = timestamp_ms
+                current_gap = sampling_interval_ms + np.random.randint(-variance, variance + 1)
         except:
             pass
             

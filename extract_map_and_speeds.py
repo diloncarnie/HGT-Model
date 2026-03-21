@@ -55,19 +55,22 @@ def parse_pneuma_to_long(filepath, test=False):
             points = parts[4:]
             sampled_pts = []
             last_included_timestamp = None
+            variance = int(sampling_interval * 0.1)  # 10% variance
+            current_gap = sampling_interval + np.random.randint(-variance, variance + 1)
             for i in range(0, len(points)-1, 6):
                 try:
                     lat, lon, speed_kmh, lon_acc, lat_acc, ts = points[i:i+6]
                     ts_float = float(ts.strip())
                     timestamp_ms = int(ts_float * 1000)
-                    
-                    if last_included_timestamp is None or timestamp_ms - last_included_timestamp >= sampling_interval:
+
+                    if last_included_timestamp is None or timestamp_ms - last_included_timestamp >= current_gap:
                         speed_ms = float(speed_kmh.strip()) / 3.6
                         sampled_pts.append([
                             float(lat.strip()), float(lon.strip()), speed_ms,
                             float(lon_acc.strip()), float(lat_acc.strip()), ts_float
                         ])
                         last_included_timestamp = timestamp_ms
+                        current_gap = 400 + np.random.randint(-40, 41)
                 except ValueError:
                     continue
             
