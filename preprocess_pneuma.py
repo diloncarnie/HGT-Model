@@ -15,6 +15,7 @@ from leuvenmapmatching.map.inmem import InMemMap
 
 chunk_size = 50  # Increased for efficiency
 sampling_interval = 1000  # 1.0Hz interpolation
+test_percentage = 0.15
 
 def get_osm_map_and_edges(gpkg_path):
     edges_gdf = gpd.read_file(gpkg_path)
@@ -308,10 +309,45 @@ def main():
     print("Starting map matching and parsing...")
     parse_start = time.time()
     
+
+    with open(input_file, 'r', encoding='utf-8') as f_count:
+        first = f_count.readline()
+        has_header = "track_id" in first
+        num_vehicles = 0
+        if not has_header:
+            f_count.seek(0)
+        
+        for line in f_count:
+            line = line.strip()
+            if not line: continue
+            parts = line.split(';')
+            if len(parts) > 1 and parts[1].strip() != 'Motorcycle':
+                num_vehicles += 1
+
+    if args.test:
+        limit = max(1, int(num_vehicles * test_percentage))
+        print(f"Test mode: taking {test_percentage*100:.1f}% of non-motorcycle vehicles ({limit} out of {num_vehicles})")
+    else:
+        limit = float('inf')
+
+    lines_to_process = []
     with open(input_file, 'r') as file:
-        lines = file.readlines()
-        if args.test: lines = lines[:16]
-        chunks = [lines[i:i + chunk_size] for i in range(1, len(lines), chunk_size)]
+        first_line = file.readline()
+        if "track_id" not in first_line:
+            file.seek(0)
+            
+        count = 0
+        for line in file:
+            parts = line.strip().split(';')
+            if len(parts) < 4: continue
+            
+            if parts[1].strip() != 'Motorcycle':
+                if count >= limit:
+                    break
+                lines_to_process.append(line)
+                count += 1
+
+    chunks = [lines_to_process[i:i + chunk_size] for i in range(0, len(lines_to_process), chunk_size)]
         
     pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
     for idx, chunk in enumerate(chunks):
@@ -339,17 +375,30 @@ def main():
         
     df = pd.concat(df_list, ignore_index=True)
     
+    # Ensure numeric types for columns read from CSV chunks
+    numeric_cols = ['signed_dist', 'speed', 't_proj', 'segment_length', 'num_lanes', 'lat', 'lon', 'long_acc', 'lat_acc', 'time', 'x', 'y']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
     # Global Anchor
     df['D'] = 0.0
     for seg_id, group in df.groupby('segment_id'):
-        max_d = np.percentile(group['signed_dist'], 98)
-        df.loc[group.index, 'D'] = (max_d - group['signed_dist']).clip(lower=0.0)
+        if seg_id == "" or group.empty: continue
+        # Handle cases where signed_dist might be all NaN
+        d_vals = group['signed_dist'].dropna()
+        if d_vals.empty: continue
+        
+        abs_max_d = d_vals.max() 
+        # Use .values to ensure alignment and prevent Pandas dtype coercion issues during setitem
+        df.loc[group.index, 'D'] = (abs_max_d - group['signed_dist']).clip(lower=0.0).values
         
     # O(1) Lane Assignment
     df['lane_index'] = 0
     for seg_id, bounds in lane_boundaries.items():
         mask = df['segment_id'] == seg_id
-        df.loc[mask, 'lane_index'] = np.digitize(df.loc[mask, 'D'], bins=bounds)
+        raw_indices = np.digitize(df.loc[mask, 'D'], bins=bounds)
+        df.loc[mask, 'lane_index'] = np.clip(raw_indices, 1, len(bounds) - 1) - 1
         
     print(f"Merge and lane assignment took {time.time() - merge_start:.2f} seconds")
     

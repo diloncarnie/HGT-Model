@@ -33,6 +33,8 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
 
     edges['segment_id_str'] = edges['segment_id'].astype(str)
     
+    df['track_id_str'] = df['track_id'].astype(str)
+    
     print("Generating base map...")
     
     # Create the scatter plot for trajectory points
@@ -40,7 +42,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         df,
         lat="lat",
         lon="lon",
-        color="type",
+        color="track_id_str",
         custom_data=["segment_id"], # For JS highlighting
         hover_data={
             "track_id": True,
@@ -51,6 +53,9 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
             "segment_length": ":.2f",
             "num_lanes": True,
             "lane_index": True,
+            "t_proj": ":.2f",
+            "prop_dist": ":.3f",
+            "rel_heading": ":.2f",
             "lat": False,
             "lon": False
         },
@@ -58,6 +63,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         height=800,
         title=f"Map Matching Visualization ({'All' if test else '15% Sampled'} Vehicles)"
     )
+    fig.update_layout(showlegend=False)
 
     # Add ALL road lines as a faint background layer
     lats = []
@@ -168,10 +174,10 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize map-matched trajectory points.")
     parser.add_argument('--network', default='osm_network.gpkg', help="Path to osm_network.gpkg")
     parser.add_argument('--trajectories', default='processed_data/matched_trajectories.csv', help="Path to matched_trajectories.csv")
-    parser.add_argument('--test', action='store_true', help="Visualize all points (no sampling)")
+    parser.add_argument('--all', action='store_true', help="Visualize all points (no sampling)")
     args = parser.parse_args()
     
-    visualize_map_matching(args.network, args.trajectories, args.test)
+    visualize_map_matching(args.network, args.trajectories, args.all)
 
 if __name__ == '__main__':
     main()

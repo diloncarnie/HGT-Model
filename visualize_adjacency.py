@@ -190,8 +190,8 @@ def visualize_adjacency(network_file, adjacency_file):
 
 def main():
     parser = argparse.ArgumentParser(description="Interactively visualize road adjacency.")
-    parser.add_argument('network_file', help="Path to osm_network.gpkg")
-    parser.add_argument('adjacency_file', help="Path to topological_adjacency.json")
+    parser.add_argument('--network_file', default="osm_network.gpkg", help="Path to osm_network.gpkg")
+    parser.add_argument('--adjacency_file', default="topological_adjacency.json", help="Path to topological_adjacency.json")
     args = parser.parse_args()
     
     visualize_adjacency(args.network_file, args.adjacency_file)

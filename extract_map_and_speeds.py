@@ -2,16 +2,22 @@ import argparse
 import time
 import os
 import json
+import multiprocessing
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import jenkspy
 from shapely.geometry import Point, LineString
 from leuvenmapmatching.matcher.distance import DistanceMatcher
 from leuvenmapmatching.map.inmem import InMemMap
+from scipy.spatial import KDTree
 
-sampling_interval = 400  # 1.0Hz interpolation
+sampling_interval = 1000  # 1.0Hz interpolation
+test_percentage = 0.05  # Percentage of vehicles to take in test mode
+debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "2390", "12974", "335"]
 
 def get_osm_map(edges_gdf):
     map_con = InMemMap("osm", use_latlon=False, use_rtree=True, index_edges=True)
@@ -27,6 +33,27 @@ def parse_pneuma_to_long(filepath, test=False):
     print(f"Parsing {filepath}...")
     start_time = time.time()
     
+    if test:
+        # Quick count total non-motorcycle vehicles to take percentage
+        with open(filepath, 'r', encoding='utf-8') as f_count:
+            first = f_count.readline()
+            has_header = "track_id" in first
+            num_vehicles = 0
+            if not has_header:
+                f_count.seek(0)
+            
+            for line in f_count:
+                line = line.strip()
+                if not line: continue
+                parts = line.split(';')
+                if len(parts) > 1 and parts[1].strip() != 'Motorcycle':
+                    num_vehicles += 1
+                    
+        limit = max(1, int(num_vehicles * test_percentage))
+        print(f"Test mode: taking {test_percentage*100:.1f}% of non-motorcycle vehicles ({limit} out of {num_vehicles})")
+    else:
+        limit = float('inf')
+
     data_list = []
     with open(filepath, 'r') as f:
         # Skip header if present
@@ -36,7 +63,7 @@ def parse_pneuma_to_long(filepath, test=False):
             
         count = 0
         for line in f:
-            if test and count >= 15:
+            if count >= limit:
                 break
             
             parts = line.strip().split(';')
@@ -56,8 +83,8 @@ def parse_pneuma_to_long(filepath, test=False):
             sampled_pts = []
             last_included_timestamp = None
             variance = int(sampling_interval * 0.1)  # 10% variance
-            current_gap = sampling_interval + np.random.randint(-variance, variance + 1)
             for i in range(0, len(points)-1, 6):
+                current_gap = sampling_interval + np.random.randint(-variance, variance + 1)
                 try:
                     lat, lon, speed_kmh, lon_acc, lat_acc, ts = points[i:i+6]
                     ts_float = float(ts.strip())
@@ -70,12 +97,14 @@ def parse_pneuma_to_long(filepath, test=False):
                             float(lon_acc.strip()), float(lat_acc.strip()), ts_float
                         ])
                         last_included_timestamp = timestamp_ms
-                        current_gap = 400 + np.random.randint(-40, 41)
                 except ValueError:
                     continue
             
-            # Filter duration < 5.0s
-            if len(sampled_pts) > 0 and sampled_pts[-1][-1] - sampled_pts[0][-1] >= 5.0:
+            # Filter duration < 5.0s, traveled_distance < 20m, and avg_speed < 1m/s
+            if (len(sampled_pts) > 0 and 
+                sampled_pts[-1][-1] - sampled_pts[0][-1] >= 5.0 and
+                float(traveled_d) >= 20.0 and
+                avg_speed_ms >= 1.0):
                 for p in sampled_pts:
                     data_list.append([track_id, v_type, traveled_d, avg_speed_ms] + p)
                 
@@ -89,8 +118,154 @@ def parse_pneuma_to_long(filepath, test=False):
     print(f"Parsing took {time.time() - start_time:.2f} seconds. Parsed {len(df)} points.")
     return df
 
-def perform_map_matching(df, map_con, crs, max_dist_start=5, max_dist_end=50, step=5):
-    print("Performing iterative map matching...")
+def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_dist_start=5, max_dist_end=15, step=5):
+    edges_gdf = gpd.read_file(gpkg_path)
+    map_con = get_osm_map(edges_gdf)
+    
+    # Pre-map edge attributes for fast lookup
+    edge_map = {}
+    lanes_map = {}
+    len_map = {}
+    uv_to_seg = {}
+    hw_map = {}
+    for _, row in edges_gdf.iterrows():
+        key = (int(row['u']), int(row['v']))
+        edge_map[key] = row['geometry']
+        lanes_map[key] = int(row['lanes'])
+        len_map[key] = float(row['length'])
+        uv_to_seg[key] = str(row['segment_id'])
+        hw_map[key] = str(row['highway'])
+    
+    matched_results = []
+    grouped = chunk_df.groupby('track_id')
+    
+    for track_id, group in grouped:
+        path = group[['x', 'y']].values.tolist()
+        
+        matcher = None
+        matched_states = None
+        for max_dist in range(max_dist_start, max_dist_end + 1, step):
+            # non_emitting_states=False ensures 1:1 mapping between observations and states
+            matcher = DistanceMatcher(map_con, max_dist=max_dist, obs_noise=max_dist, non_emitting_states=False)
+            states, last_idx = matcher.match(path)
+            if states and (last_idx == len(path) - 1 or max_dist == max_dist_end):
+                matched_states = states
+                break
+                
+        if not matched_states:
+            continue
+            
+        group_results = group.iloc[:len(matched_states)].copy()
+        
+        u_list = []
+        v_list = []
+        for s in matched_states:
+            if isinstance(s, tuple) and len(s) >= 2:
+                u_list.append(int(s[0]))
+                v_list.append(int(s[1]))
+            else:
+                u_list.append(int(s))
+                v_list.append(int(s))
+                
+        group_results['matched_u'] = u_list
+        group_results['matched_v'] = v_list
+        
+        # Calculate vehicle azimuth (azcar)
+        dx = group_results['x'].diff().bfill().fillna(0)
+        dy = group_results['y'].diff().bfill().fillna(0)
+        group_results['azcar'] = np.arctan2(dx, dy) * 180 / np.pi
+        
+        # Calculate signed distance and segment info immediately
+        signed_distances = []
+        segment_ids = []
+        num_lanes_list = []
+        segment_lengths = []
+        prop_distances = []
+        rel_headings = []
+        highways_list = []
+        t_projs = []
+        
+        for idx, row in group_results.iterrows():
+            u, v = row['matched_u'], row['matched_v']
+            key = (u, v)
+            if key not in edge_map:
+                signed_distances.append(0.0)
+                segment_ids.append("")
+                num_lanes_list.append(0)
+                segment_lengths.append(0.0)
+                prop_distances.append(0.5)
+                rel_headings.append(0.0)
+                highways_list.append("")
+                t_projs.append(0.0)
+                continue
+                
+            geom = edge_map[key]
+            coords = list(geom.coords)
+            px, py = row['x'], row['y']
+            
+            best_dist = float('inf')
+            signed_d = 0.0
+            dist_along = 0.0
+            best_az_sub = 0.0
+            
+            current_accumulated_l = 0.0
+            for i in range(len(coords)-1):
+                ax, ay = coords[i]
+                bx, by = coords[i+1]
+                a = np.array([ax, ay])
+                b = np.array([bx, by])
+                p = np.array([px, py])
+                
+                ab = b - a
+                ap = p - a
+                sub_l2 = np.dot(ab, ab)
+                if sub_l2 == 0: continue
+                
+                t = max(0, min(1, np.dot(ap, ab) / sub_l2))
+                proj = a + t * ab
+                dist = np.linalg.norm(p - proj)
+                
+                if dist < best_dist:
+                    best_dist = dist
+                    cross = ab[0]*ap[1] - ab[1]*ap[0]
+                    signed_d = dist * (-1 if cross > 0 else 1)
+                    dist_along = current_accumulated_l + t * np.sqrt(sub_l2)
+                    # Local azimuth of this specific sub-segment
+                    best_az_sub = np.arctan2(ab[0], ab[1]) * 180 / np.pi
+                
+                current_accumulated_l += np.sqrt(sub_l2)
+            
+            total_l = len_map.get(key, current_accumulated_l or 1.0)
+            signed_distances.append(signed_d)
+            segment_ids.append(uv_to_seg.get(key, str(key)))
+            num_lanes_list.append(lanes_map.get(key, 2))
+            segment_lengths.append(total_l)
+            prop_distances.append(dist_along / total_l)
+            highways_list.append(hw_map.get(key, "unknown"))
+            t_projs.append(dist_along)
+            
+            # Relative heading: difference between vehicle azimuth and sub-segment azimuth
+            rel_h = np.abs((row['azcar'] - best_az_sub + 180) % 360 - 180)
+            rel_headings.append(rel_h)
+            
+        group_results['signed_dist'] = signed_distances
+        group_results['segment_id'] = segment_ids
+        group_results['num_lanes'] = num_lanes_list
+        group_results['segment_length'] = segment_lengths
+        group_results['prop_dist'] = prop_distances
+        group_results['rel_heading'] = rel_headings
+        group_results['highway'] = highways_list
+        group_results['t_proj'] = t_projs
+                
+        matched_results.append(group_results)
+        
+    if not matched_results:
+        return pd.DataFrame()
+        
+    return pd.concat(matched_results, ignore_index=True)
+
+def perform_map_matching(df, crs, gpkg_path='osm_network.gpkg', max_dist_start=5, max_dist_end=25, step=5):
+    print("Performing iterative map matching and distance calculation with multiprocessing...")
     start_time = time.time()
     
     # Project to CRS
@@ -99,195 +274,231 @@ def perform_map_matching(df, map_con, crs, max_dist_start=5, max_dist_end=50, st
     df['x'] = gdf.geometry.x
     df['y'] = gdf.geometry.y
     
-    matched_results = []
+    track_ids = df['track_id'].unique()
+    num_processes = multiprocessing.cpu_count()
+    chunks = np.array_split(track_ids, num_processes)
     
-    # Group by track_id
-    grouped = df.groupby('track_id')
+    chunk_dfs = [df[df['track_id'].isin(chunk.tolist())] for chunk in chunks if len(chunk) > 0]
     
-    for track_id, group in grouped:
-        path = group[['x', 'y']].values.tolist()
-        
-        matcher = None
-        matched_states = None
-        for max_dist in range(max_dist_start, max_dist_end + 1, step):
-            matcher = DistanceMatcher(map_con, max_dist=max_dist, obs_noise=max_dist, obs_noise_ne=max_dist*2)
-            states, last_idx = matcher.match(path)
-            # Continue trying larger max_dist if we don't have a complete match
-            if states and (last_idx == len(path) - 1 or max_dist == max_dist_end):
-                matched_states = states
-                break
-                
-        if not matched_states:
-            continue
-            
-        # We need to slice group to match the length of matched_states
-        # in case last_idx < len(path) - 1 but we still want to keep the partial match
-        group_results = group.iloc[:len(matched_states)].copy()
-        
-        u_list = []
-        v_list = []
-        for s in matched_states:
-            if isinstance(s, tuple) and len(s) >= 2:
-                u_list.append(s[0])
-                v_list.append(s[1])
-            else:
-                u_list.append(s)
-                v_list.append(s)
-                
-        group_results['matched_u'] = u_list
-        group_results['matched_v'] = v_list
-                
-        matched_results.append(group_results)
-        
-    if not matched_results:
-        print("No matches found.")
-        return pd.DataFrame()
-        
-    final_df = pd.concat(matched_results, ignore_index=True)
-    print(f"Map matching took {time.time() - start_time:.2f} seconds. Matched {len(final_df)} points.")
+    pool = multiprocessing.Pool(processes=num_processes)
+    results = pool.starmap(process_map_matching_chunk, [(cdf, crs, gpkg_path, max_dist_start, max_dist_end, step) for cdf in chunk_dfs])
+    pool.close()
+    pool.join()
+    
+    final_df = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
+    print(f"Map matching and distance calculation took {time.time() - start_time:.2f} seconds. Matched {len(final_df)} points.")
     return final_df
 
-def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir):
-    print("Calculating lane boundaries...")
+def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
+    if test:
+        print("Performing Jenks Optimization...")
     start_time = time.time()
-    
-    # Map edges to geometries and segment_ids
-    edge_map = {}
-    lanes_map = {}
-    len_map = {}
-    for _, row in edges_gdf.iterrows():
-        key = (int(row['u']), int(row['v']))
-        edge_map[key] = row['geometry']
-        lanes_map[key] = int(row['lanes'])
-        len_map[key] = float(row['length'])
-        
-    df['signed_dist'] = np.nan
-    df['segment_id'] = ""
-    df['num_lanes'] = 0
-    df['segment_length'] = 0.0
-    
-    # Build dictionary from u, v to segment_id
-    uv_to_seg = edges_gdf.set_index(['u', 'v'])['segment_id'].to_dict()
-    
-    for idx, row in df.iterrows():
-        u, v = int(row['matched_u']), int(row['matched_v'])
-        key = (u, v)
-        if key not in edge_map: continue
-        
-        geom = edge_map[key]
-        coords = list(geom.coords)
-        
-        px, py = row['x'], row['y']
-        
-        # Simplified: find the closest line segment of the LineString
-        best_dist = float('inf')
-        signed_d = 0.0
-        
-        for i in range(len(coords)-1):
-            ax, ay = coords[i]
-            bx, by = coords[i+1]
-            
-            p = np.array([px, py])
-            a = np.array([ax, ay])
-            b = np.array([bx, by])
-            
-            ab = b - a
-            ap = p - a
-            
-            norm_ab = np.dot(ab, ab)
-            if norm_ab == 0: continue
-            
-            t = max(0, min(1, np.dot(ap, ab) / norm_ab))
-            proj = a + t * ab
-            dist = np.linalg.norm(p - proj)
-            
-            if dist < best_dist:
-                best_dist = dist
-                # Cross product: AB x AP
-                cross = ab[0]*ap[1] - ab[1]*ap[0]
-                # If cross > 0, AP is to the left of AB. We want negative for left, positive for right.
-                # So we take -cross
-                sign = -1 if cross > 0 else 1
-                signed_d = dist * sign
-                
-        df.at[idx, 'signed_dist'] = signed_d
-        df.at[idx, 'segment_id'] = uv_to_seg.get(key, str(key))
-        df.at[idx, 'num_lanes'] = lanes_map.get(key, 2)
-        df.at[idx, 'segment_length'] = len_map.get(key, 0.0)
-        
+
+    # Calculate and print max samples
+    if test:
+        counts = df[df['segment_id'] != ""]['segment_id'].value_counts()
+        if not counts.empty:
+            print(f"Maximum samples in a single segment: {counts.max()}")
+
     # Process Jenks
     lane_boundaries = {}
     jenks_segments_used = []
-    
+
     grouped = df.groupby('segment_id')
-    
-    print("Performing Jenks Optimization...")
+
     for seg_id, group in grouped:
         if seg_id == "": continue
-        
+
         d_vals = group['signed_dist'].values
-        max_d = np.percentile(d_vals, 98)
-        
+        # Use 99th percentile for robust road width estimation
+        abs_max_d = np.percentile(d_vals, 98)
+
         # D = Max_Distance - Vehicle_Distance
-        group['D'] = max_d - group['signed_dist']
-        group['D'] = group['D'].clip(lower=0.0)
-        
-        D_vals = group['D'].values
-        
-        # Get lanes count from OSM (approx)
-        u, v = group.iloc[0]['matched_u'], group.iloc[0]['matched_v']
-        num_lanes = lanes_map.get((u, v), 2)
-        
-        if len(D_vals) > 50 and num_lanes > 1:
-            sample = np.random.choice(D_vals, min(5000, len(D_vals)), replace=False)
-            try:
-                breaks = jenkspy.jenks_breaks(sample, n_classes=num_lanes)
-                # Enforce widths 2.5m - 4.0m between breaks (heuristic validation)
-                valid = True
-                for i in range(1, len(breaks)):
-                    width = breaks[i] - breaks[i-1]
-                    if width < 2.0 or width > 5.0:  # Relaxed for Jenks
-                        valid = False
-                
-                if valid:
-                    lane_boundaries[seg_id] = breaks
-                    jenks_segments_used.append(seg_id)
-                else:
-                    lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes + 1)]
-            except ValueError:
-                lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes + 1)]
-        else:
-            # Static fallback
-            lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes + 1)]
+        df.loc[group.index, 'D'] = (abs_max_d - group['signed_dist']).clip(lower=0.0)
+        D_vals = df.loc[group.index, 'D'].values
+
+        num_lanes_osm = int(group['num_lanes'].iloc[0])
+
+        if len(D_vals) > 50:
+            # Iterative filtering for speed (5, 3, 1) while maintaining the current rel_heading filter
+            hq_D_final = None
+            for s_thresh in [7.5, 5.0, 3.0, 1.0]:
+                mask = (group['speed'] > s_thresh) & (group['rel_heading'] < 5.0)
+                if mask.sum() >= 50:
+                    hq_D_final = D_vals[mask.values]
+                    if test:
+                        print(f"Segment {seg_id}: Retained {len(hq_D_final)} points using speed > {s_thresh}")
+                    break
             
-        df.loc[group.index, 'D'] = group['D']
-        
-    # Assign lane index
+            if hq_D_final is None:
+                hq_D_final = D_vals
+                if test:
+                    print(f"Segment {seg_id}: Defaulting to original distribution")
+
+            # Use raw min/max instead of percentiles
+            road_min, road_max = hq_D_final.min(), hq_D_final.max()
+            hq_D_trimmed = hq_D_final # No longer trimming
+
+            # Balanced Sampling: Take an equal-ish number of samples from across the distribution
+            counts, bins = np.histogram(hq_D_trimmed, bins=40)
+            target_per_bin = max(10, 15000 // (len(counts[counts > 0]) or 1))
+
+            balanced_sample = []
+            for i in range(len(counts)):
+                if counts[i] == 0: continue
+                bin_mask = (hq_D_trimmed >= bins[i]) & (hq_D_trimmed <= bins[i+1])
+                bin_vals = hq_D_trimmed[bin_mask]
+                balanced_sample.extend(np.random.choice(bin_vals, min(len(bin_vals), target_per_bin), replace=False))
+
+            sample = np.array(balanced_sample)
+
+            # Iterative Lane Partitioning: Start with max_distance / avg_lane_width
+            max_distance = (road_max - road_min)  
+            avg_lane_width = 3.2
+            initial_k = max(1, round(max_distance / avg_lane_width))
+
+            best_breaks = None
+            if initial_k == 1:
+                # Informed decision for 1 lane: Try Jenks for 2 or 3 lanes.
+                for k in [2, 3]:
+                    try:
+                        breaks = jenkspy.jenks_breaks(sample, n_classes=k)
+                        valid = True
+                        for i in range(1, len(breaks)):
+                            width = breaks[i] - breaks[i-1]
+                            if width < 1.6 or width > 4.0:
+                                valid = False
+                                break
+                        if valid:
+                            best_breaks = breaks
+                            if test:
+                                print(f"Segment {seg_id}: Increased 1-lane guess to {k} lanes based on Jenks.")
+                            break
+                    except ValueError:
+                        continue
+                
+                # If neither 2 nor 3 lanes worked, default to road_min and road_max
+                if best_breaks is None:
+                    best_breaks = [road_min, road_max]
+                    if test:
+                        print(f"Segment {seg_id}: Defaulted to 1 lane [road_min, road_max].")
+            else:
+                k = initial_k
+                max_k = initial_k + 2  # Allow up to 2 more lanes than initial guess if needed
+                
+                while k <= max_k:
+                    try:
+                        breaks = jenkspy.jenks_breaks(sample, n_classes=k)
+                        # Validate widths: lanes must be between 2.5m and 4.0m wide
+                        valid = True
+                        for i in range(1, len(breaks)):
+                            width = breaks[i] - breaks[i-1]
+                            if width < 2.5 or width > 4.0:
+                                valid = False
+                                break
+                        if valid:
+                            best_breaks = breaks
+                            if test:
+                                print(f"Segment {seg_id}: Determined {k} lanes (Initial guess: {initial_k}).")
+                            break
+                        else:
+                            k += 1 # Keep partitioning into more lanes
+                    except ValueError:
+                        break
+                
+                # If still no valid configuration, try reducing the number of lanes (up to 2 lower)
+                if best_breaks is None:
+                    for k_red in [initial_k - 1, initial_k - 2]:
+                        if k_red < 1: continue
+                        try:
+                            breaks = jenkspy.jenks_breaks(sample, n_classes=k_red)
+                            valid = True
+                            for i in range(1, len(breaks)):
+                                width = breaks[i] - breaks[i-1]
+                                if width < 2.0 or width > 4.0:
+                                    valid = False
+                                    break
+                            if valid:
+                                best_breaks = breaks
+                                if test:
+                                    print(f"Segment {seg_id}: Reduced to {k_red} lanes (Initial guess: {initial_k}).")
+                                break
+                        except ValueError:
+                            continue
+
+            if best_breaks:
+                lane_boundaries[seg_id] = best_breaks
+                jenks_segments_used.append(seg_id)
+            else:
+                # Fallback to initial guess
+                try:
+                    lane_boundaries[seg_id] = jenkspy.jenks_breaks(sample, n_classes=initial_k)
+                    jenks_segments_used.append(seg_id)
+                    if test:
+                        print(f"Segment {seg_id}: Jenks failed to find valid breaks. Used initial guess with {initial_k} lanes.")
+                except ValueError:
+                    lane_boundaries[seg_id] = [road_min + i * avg_lane_width for i in range(initial_k + 1)]
+        else:
+            lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes_osm + 1)]
+
+    # Lane Assignment and Outlier Removal
     df['lane_index'] = 0
+    outlier_mask = pd.Series(False, index=df.index)
+    
+    lanes_updated_count = 0
     for seg_id, bounds in lane_boundaries.items():
         mask = df['segment_id'] == seg_id
-        df.loc[mask, 'lane_index'] = np.digitize(df.loc[mask, 'D'], bins=bounds)
+        if not mask.any(): continue
+            
+        raw_indices = np.digitize(df.loc[mask, 'D'], bins=bounds)
         
-    print(f"Lane boundary calculation took {time.time() - start_time:.2f} seconds.")
-    
+        # Identify outliers (indices 0 for < bounds[0] or len(bounds) for >= bounds[-1])
+        seg_outliers = (raw_indices == 0) | (raw_indices == len(bounds))
+        outlier_mask.loc[df[mask].index[seg_outliers]] = True
+        
+        # Map valid points to 0-based lane indices (clipping here just avoids OutOfBounds errors before removal)
+        df.loc[mask, 'lane_index'] = np.clip(raw_indices, 1, len(bounds) - 1) - 1
+        
+        # Update num_lanes to match the number of detected Jenks lanes (or the original OSM lanes if Jenks wasn't used)
+        old_lanes = df.loc[mask, 'num_lanes'].iloc[0]
+        new_lanes = len(bounds) - 1
+        if old_lanes != new_lanes:
+            lanes_updated_count += 1
+            
+        df.loc[mask, 'num_lanes'] = new_lanes
+
+    if lanes_updated_count > 0:
+        print(f"Successfully updated 'num_lanes' on {lanes_updated_count} segments using empirical Jenks data.")
+    else:
+        print("No segments had their 'num_lanes' altered from the OSM default (likely due to low sample size or Jenks agreeing with OSM).")
+
+    initial_len = len(df)
+    df = df[~outlier_mask].reset_index(drop=True)
+    removed_outliers = initial_len - len(df)
+    print(f"Removed {removed_outliers} outlier trajectory points that did not fit into edge lanes.")
+
+    print(f"Jenks Optimization took {time.time() - start_time:.2f} seconds.")
+
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, 'lane_boundaries.json'), 'w') as f:
-        json.dump(lane_boundaries, f, indent=4)
-        
-    # Plot 5 debug histograms
-    if jenks_segments_used:
-        plot_segs = np.random.choice(jenks_segments_used, min(5, len(jenks_segments_used)), replace=False)
-        for seg in plot_segs:
+        json.dump(lane_boundaries, f, indent=4)        
+    
+    # Plot debug histograms for specific segments
+    for seg in debug_segments:
+        if seg in lane_boundaries:
             plt.figure(figsize=(8,4))
-            d_data = df[df['segment_id'] == seg]['D']
+            seg_group = df[df['segment_id'] == seg]
+            d_data = seg_group['D']
+            n_lanes = len(lane_boundaries[seg]) - 1
             plt.hist(d_data, bins=50, alpha=0.7)
             for b in lane_boundaries[seg]:
                 plt.axvline(b, color='r', linestyle='dashed', linewidth=2)
-            plt.title(f'Lane Boundaries for Segment {seg}')
+            plt.title(f'Lane Boundaries for Segment {seg} (Detected Lanes: {n_lanes})')
             plt.xlabel('Distance from Right Edge (m)')
             plt.ylabel('Frequency')
             plt.savefig(os.path.join(output_dir, f'histogram_seg_{seg}.png'))
             plt.close()
+            print(f"Generated debug histogram for segment {seg}.")
         
     return df
 
@@ -317,6 +528,99 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir):
         json.dump(empirical_speeds, f, indent=4)
         
     print(f"Speed calculation took {time.time() - start_time:.2f} seconds.")
+    return empirical_speeds
+
+def process_frenet_for_timestamp(group_data_tuple):
+    timestamp, df_group, adjacency, speeds = group_data_tuple
+    
+    if df_group.empty:
+        return pd.DataFrame()
+        
+    # Build KDTree
+    coords = df_group[['x', 'y']].values
+    tree = KDTree(coords)
+    
+    cavs = df_group[df_group['is_CAV'] == True]
+    if cavs.empty:
+        return pd.DataFrame()
+        
+    results = []
+    
+    for idx, ego in cavs.iterrows():
+        ego_idx = df_group.index.get_loc(idx)
+        ego_pos = coords[ego_idx]
+        ego_seg = ego['segment_id']
+        ego_D = ego['D']
+        ego_S = ego['t_proj'] # calculated explicitly in map matching
+        
+        neighbors_idx = tree.query_ball_point(ego_pos, r=70) # 50m max long + 20m lat
+        
+        valid_neighbors = []
+        for n_idx in neighbors_idx:
+            if n_idx == ego_idx: continue
+            n_row = df_group.iloc[n_idx]
+            n_seg = n_row['segment_id']
+            
+            # Topological Check
+            if n_seg == ego_seg:
+                delta_S = n_row['t_proj'] - ego_S
+            elif n_seg in adjacency.get(ego_seg, {}).get('successors', []):
+                delta_S = (ego['segment_length'] - ego_S) + n_row['t_proj']
+            elif n_seg in adjacency.get(ego_seg, {}).get('predecessors', []):
+                delta_S = -ego_S - (n_row['segment_length'] - n_row['t_proj'])
+            else:
+                continue
+                
+            delta_D = n_row['D'] - ego_D
+            valid_neighbors.append({
+                'delta_S': delta_S,
+                'delta_D': delta_D,
+                'speed': n_row['speed'],
+                'type': n_row['type']
+            })
+            
+        # Zones
+        zones = {'proceeding': [], 'following': [], 'leftwards': [], 'rightwards': []}
+        for n in valid_neighbors:
+            dS = n['delta_S']
+            dD = n['delta_D']
+            v_len = 5.0 if n['type'] in ['Car', 'Taxi'] else 12.5 # approx lengths
+            
+            if 0 < dS <= 50 and -1.6 <= dD <= 1.6:
+                zones['proceeding'].append((n['speed'], v_len))
+            elif -50 <= dS < 0 and -1.6 <= dD <= 1.6:
+                zones['following'].append((n['speed'], v_len))
+            elif -50 <= dS <= 50 and dD > 1.6:
+                zones['leftwards'].append((n['speed'], v_len))
+            elif -50 <= dS <= 50 and dD < -1.6:
+                zones['rightwards'].append((n['speed'], v_len))
+                
+        ego_res = ego.to_dict()
+        rem_lanes = max(1, ego['num_lanes'] - 1)
+        
+        for z in ['proceeding', 'following', 'leftwards', 'rightwards']:
+            if not zones[z]:
+                ego_res[f'raw_density_{z}'] = 0
+                ego_res[f'raw_speed_{z}'] = speeds.get(ego_seg, 10.0) # Impute free flow
+                ego_res[f'relative_occupancy_{z}'] = 0.0
+                ego_res[f'relative_speed_{z}'] = 1.0
+            else:
+                ego_res[f'raw_density_{z}'] = len(zones[z])
+                ego_res[f'raw_speed_{z}'] = np.mean([x[0] for x in zones[z]])
+                
+                # Occupancy = sum(length + 2) / Area
+                occ_sum = sum([x[1] + 2.0 for x in zones[z]])
+                if z in ['proceeding', 'following']:
+                    occ = min(1.0, occ_sum / 50.0)
+                else:
+                    occ = min(1.0, occ_sum / (100.0 * rem_lanes))
+                ego_res[f'relative_occupancy_{z}'] = occ
+                
+                ego_res[f'relative_speed_{z}'] = ego_res[f'raw_speed_{z}'] / max(1.0, speeds.get(ego_seg, 10.0))
+                
+        results.append(ego_res)
+        
+    return pd.DataFrame(results)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -338,27 +642,117 @@ def main():
         
     print("Loading OSM network...")
     edges_gdf = gpd.read_file('osm_network.gpkg')
-    map_con = get_osm_map(edges_gdf)
     
     df = parse_pneuma_to_long(input_file, test=args.test)
     if df.empty:
         print("No data parsed.")
         return
         
-    df = perform_map_matching(df, map_con, edges_gdf.crs)
+    df = perform_map_matching(df, edges_gdf.crs, 'osm_network.gpkg')
     if df.empty:
         return
         
     output_dir = "processed_data"
-    df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir)
-    calculate_empirical_speeds(df, edges_gdf, output_dir)
+    df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=args.test)
+    empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir)
     
     # Export matched trajectories for visualization
     matched_trajectories_path = os.path.join(output_dir, "matched_trajectories.csv")
     print(f"Exporting matched trajectories to {matched_trajectories_path}...")
     df.to_csv(matched_trajectories_path, index=False)
     
-    print(f"Total initialization completed in {time.time() - overall_start:.2f} seconds.")
+    # ---------------------------------------------------------
+    # PIPELINE INTEGRATION: Spatial & Ego-Centric Extraction
+    # ---------------------------------------------------------
+    print("\n--- Starting Ego-Centric Pipeline ---")
+    
+    # Prepare DataFrame columns for Ego-Centric extraction
+    df['segment_type'] = df['highway']
+    df.rename(columns={
+        'traveled_d': 'traveled_distance', 
+        'lon_acc': 'long_acc', 
+        'prop_dist': 'proportionate_distance_travelled'
+    }, inplace=True)
+    
+    print("Loading topological adjacency...")
+    try:
+        with open('topological_adjacency.json', 'r') as f:
+            adjacency = json.load(f)
+    except FileNotFoundError:
+        print("Error: topological_adjacency.json not found. Make sure to run the external OSM downloader script.")
+        return
+        
+    # Stratified Sampling (15% of CAVs per 5-minute bin)
+    print("Performing stratified sampling (15% CAVs per 5-minute bin)...")
+    df['time_bin'] = (df['time'] // 300) * 300
+    df['is_CAV'] = False
+    
+    for _, group in df[df['type'].isin(['Car', 'Taxi'])].groupby('time_bin'):
+        unique_tracks = group['track_id'].unique()
+        n_sample = max(1, int(len(unique_tracks) * 0.15))
+        sampled = np.random.choice(unique_tracks, n_sample, replace=False)
+        df.loc[df['track_id'].isin(sampled), 'is_CAV'] = True
+        
+    # Frenet Ego-Centric Extraction
+    print("Extracting spatial features via KDTree (using 1-second time buckets)...")
+    kdtree_start = time.time()
+    
+    # Create 1-second time buckets to align vehicles that have jittered timestamps
+    df['time_bucket'] = np.round(df['time']).astype(int)
+    
+    time_groups = []
+    for ts, group in df.groupby('time_bucket'):
+        time_groups.append((ts, group.copy(), adjacency, empirical_speeds))
+        
+    pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+    results = pool.map(process_frenet_for_timestamp, time_groups)
+    pool.close()
+    pool.join()
+    
+    final_df = pd.concat([r for r in results if not r.empty], ignore_index=True)
+    print(f"Feature extraction took {time.time() - kdtree_start:.2f} seconds")
+    
+    if final_df.empty:
+        print("No valid CAV features extracted. Exiting.")
+        return
+
+    # Deferred Kinematics Calculation (Calculated only for remaining CAVs)
+    print("Calculating final kinematics...")
+    kin_start = time.time()
+    
+    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(empirical_speeds).fillna(10.0)
+    final_df['relative_ego_speed'] = final_df['speed'] / final_df['segment_free_flow_speed']
+    
+    final_df = final_df.sort_values(['track_id', 'time'])
+    
+    final_df['change_in_euclidean_distance'] = final_df.groupby('track_id').apply(
+        lambda x: np.sqrt((x['x'].diff()**2) + (x['y'].diff()**2))
+    ).reset_index(level=0, drop=True)
+    
+    final_df['relative_time_gap'] = final_df.groupby('track_id')['time'].diff()
+    
+    final_df['relative_kinematic_ratio'] = final_df['change_in_euclidean_distance'] / (final_df['segment_free_flow_speed'] * final_df['relative_time_gap'])
+    final_df['relative_kinematic_ratio'] = final_df['relative_kinematic_ratio'].clip(upper=1.0)
+    
+    print(f"Kinematics took {time.time() - kin_start:.2f} seconds")
+    
+    # Export Final Fully Processed CSV
+    out_cols = [
+        'track_id', 'type', 'traveled_distance', 'avg_speed', 'lat', 'lon', 'speed', 'long_acc', 'lat_acc', 'time',
+        'segment_id', 'segment_length', 'segment_type', 'num_lanes', 'lane_index', 'proportionate_distance_travelled',
+        'change_in_euclidean_distance', 'relative_time_gap', 'relative_kinematic_ratio',
+        'relative_occupancy_proceeding', 'relative_occupancy_following', 'relative_occupancy_leftwards', 'relative_occupancy_rightwards',
+        'raw_density_proceeding', 'raw_density_following', 'raw_density_leftwards', 'raw_density_rightwards',
+        'segment_free_flow_speed', 'relative_ego_speed',
+        'relative_speed_proceeding', 'relative_speed_following', 'relative_speed_leftwards', 'relative_speed_rightwards',
+        'raw_speed_proceeding', 'raw_speed_following', 'raw_speed_leftwards', 'raw_speed_rightwards'
+    ]
+    
+    final_out_path = os.path.join(output_dir, os.path.basename(input_file).replace('.csv', '_processed.csv'))
+    final_df[out_cols].to_csv(final_out_path, index=False)
+    
+    print(f"\nPipeline finished! Saved fully processed dataset to {final_out_path}")
+    print(f"Total pipeline execution completed in {time.time() - overall_start:.2f} seconds.")
 
 if __name__ == '__main__':
     main()

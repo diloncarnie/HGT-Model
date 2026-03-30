@@ -351,7 +351,7 @@ You must use this script as your starting template. Modify and expand it accordi
 2. **Standardization & Ghost Node Prep:** Parse wide-to-long using multiprocessing. Convert speeds from km/h to m/s immediately. 
    - **Class Filter:** Drop "Motorcycles" ONLY. Retain Cars, Taxis, Medium/Heavy Vehicles, and Buses (Ghost Nodes for spatial occupancy).
    - **Duration Filter:** Drop trajectories < 5.0s duration. 
-   - **Temporal Prep (Empirical Downsampling):** Utilize the template's sampling logic to retain empirical trajectory points. Set `sampling_interval = 1000` (1.0s). Retain the empirical points where the time gap from the previously retained point is $\ge 1.0s$. This preserves the natural recording variance of the dataset while achieving an average 1.0Hz frequency. Calculate the exact `relative_time_gap` between these newly retained points.
+    - **Temporal Prep (Empirical Downsampling):** Utilize the template's sampling logic to retain empirical trajectory points. Set `sampling_interval = 1000` (1.0s). Retain the empirical points where the time gap from the previously retained point is $\ge 1.0s$. This preserves the natural recording variance of the dataset while achieving an average 1.0Hz frequency. Calculate the exact `relative_time_gap` between these newly retained points.
 3. **Unified Map-Matching:** Map-match ALL remaining vehicles using the iterative leuvenmapmatching logic. 
     - *Post-Match Filters:* Drop trajectories if the angular difference between the vehicle's vector and the road's vector is > 90 degrees, or if the max orthogonal distance to the edge is > 10m.
     - Extract `segment_id`, `segment_length`, `segment_type`, `num_lanes`.
