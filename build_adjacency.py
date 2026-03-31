@@ -86,7 +86,7 @@ def get_smoothed_heading(geom, reverse=False, look_dist=10.0):
         
     return math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
 
-def build_topological_adjacency(edges_gdf):
+def build_topological_adjacency(edges_gdf, target_dist=55.0):
     print("Building topological lookups...")
     # Grouping by node IDs
     edges_by_u = edges_gdf.groupby('u')['segment_id'].apply(list).to_dict()
@@ -94,7 +94,7 @@ def build_topological_adjacency(edges_gdf):
     
     adjacency = {}
     
-    print("Pre-calculating smoothed headings (10m window)...")
+    print("Pre-calculating smoothed headings and lengths...")
     segment_data = {}
     for _, row in edges_gdf.iterrows():
         sid = str(row['segment_id'])
@@ -103,53 +103,89 @@ def build_topological_adjacency(edges_gdf):
             'u': row['u'],
             'v': row['v'],
             'osmid': str(row['osmid']),
+            'length': float(row['length']),
             'exit_heading': get_smoothed_heading(geom, reverse=False),
             'entry_heading': get_smoothed_heading(geom, reverse=True)
         }
 
-    print("Analyzing topological connections...")
+    print("Analyzing topological connections (choosing best fits)...")
+    # First pass: find the single BEST immediate successor and predecessor for every segment
+    best_immediate = {}
     for ego_id, data in segment_data.items():
         u_node, v_node = data['u'], data['v']
         ego_osmid = data['osmid']
         
-        valid_successors = []
-        valid_predecessors = []
+        # 1. BEST SUCCESSOR
+        best_succ = None
+        min_delta_succ = float('inf')
         
-        # 1. SUCCESSORS: segments starting where we end (v_node)
         potential_successors = edges_by_u.get(v_node, [])
         for succ_id in potential_successors:
-            succ_id_str = str(succ_id)
-            if succ_id_str == ego_id: continue
+            sid_str = str(succ_id)
+            if sid_str == ego_id: continue
             
-            # Heading Check
-            succ_heading = segment_data[succ_id_str]['entry_heading']
-            delta_theta = (succ_heading - data['exit_heading'] + 180) % 360 - 180
+            succ_heading = segment_data[sid_str]['entry_heading']
+            delta_theta = abs((succ_heading - data['exit_heading'] + 180) % 360 - 180)
             
-            # Same OSM Way Check (Priority)
-            is_same_way = segment_data[succ_id_str]['osmid'] == ego_osmid
+            is_same_way = segment_data[sid_str]['osmid'] == ego_osmid
             threshold = 60.0 if is_same_way else 45.0
             
-            if abs(delta_theta) <= threshold:
-                valid_successors.append(succ_id_str)
-                
-        # 2. PREDECESSORS: segments ending where we start (u_node)
+            if delta_theta <= threshold and delta_theta < min_delta_succ:
+                min_delta_succ = delta_theta
+                best_succ = sid_str
+        
+        # 2. BEST PREDECESSOR
+        best_pred = None
+        min_delta_pred = float('inf')
+        
         potential_predecessors = edges_by_v.get(u_node, [])
         for pred_id in potential_predecessors:
-            pred_id_str = str(pred_id)
-            if pred_id_str == ego_id: continue
+            sid_str = str(pred_id)
+            if sid_str == ego_id: continue
             
-            pred_heading = segment_data[pred_id_str]['exit_heading']
-            delta_theta = (data['entry_heading'] - pred_heading + 180) % 360 - 180
+            pred_heading = segment_data[sid_str]['exit_heading']
+            delta_theta = abs((data['entry_heading'] - pred_heading + 180) % 360 - 180)
             
-            is_same_way = segment_data[pred_id_str]['osmid'] == ego_osmid
+            is_same_way = segment_data[sid_str]['osmid'] == ego_osmid
             threshold = 60.0 if is_same_way else 45.0
             
-            if abs(delta_theta) <= threshold:
-                valid_predecessors.append(pred_id_str)
+            if delta_theta <= threshold and delta_theta < min_delta_pred:
+                min_delta_pred = delta_theta
+                best_pred = sid_str
                 
+        best_immediate[ego_id] = {'successor': best_succ, 'predecessor': best_pred}
+
+    print(f"Chaining segments to reach {target_dist}m...")
+    for ego_id in segment_data.keys():
+        # Build Successor Chain
+        succ_chain = []
+        curr_dist = 0.0
+        curr_id = ego_id
+        while curr_dist < target_dist:
+            next_id = best_immediate[curr_id]['successor']
+            if not next_id or next_id in succ_chain or next_id == ego_id:
+                break
+            succ_chain.append(next_id)
+            curr_dist += segment_data[next_id]['length']
+            curr_id = next_id
+            
+        # Build Predecessor Chain
+        pred_chain = []
+        curr_dist = 0.0
+        curr_id = ego_id
+        while curr_dist < target_dist:
+            prev_id = best_immediate[curr_id]['predecessor']
+            if not prev_id or prev_id in pred_chain or prev_id == ego_id:
+                break
+            pred_chain.append(prev_id)
+            curr_dist += segment_data[prev_id]['length']
+            curr_id = prev_id
+            
         adjacency[ego_id] = {
-            'successors': valid_successors,
-            'predecessors': valid_predecessors
+            'successors': succ_chain,
+            'predecessors': pred_chain,
+            'successor_lengths': [segment_data[sid]['length'] for sid in succ_chain],
+            'predecessor_lengths': [segment_data[sid]['length'] for sid in pred_chain]
         }
         
     return adjacency

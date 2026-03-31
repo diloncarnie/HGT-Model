@@ -18,14 +18,16 @@ def visualize_adjacency(network_file, adjacency_file):
     edges['segment_id_str'] = edges['segment_id'].astype(str)
     
     # Add adjacency info to edges for hover
-    def get_adj_str(sid, key):
-        items = adjacency.get(str(sid), {}).get(key, [])
-        if len(items) > 5:
-            return f"{len(items)} items: {items[:5]}..."
-        return str(items)
+    def get_adj_summary(sid, key):
+        chain = adjacency.get(str(sid), {}).get(key, [])
+        lengths = adjacency.get(str(sid), {}).get(f"{key[:-1]}_lengths", [])
+        if not chain:
+            return "None"
+        total_len = sum(lengths)
+        return f"{len(chain)} segments ({total_len:.1f}m): {chain}"
 
-    edges['successors_list'] = edges['segment_id_str'].apply(lambda x: get_adj_str(x, 'successors'))
-    edges['predecessors_list'] = edges['segment_id_str'].apply(lambda x: get_adj_str(x, 'predecessors'))
+    edges['successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'successors'))
+    edges['predecessors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'predecessors'))
 
     print("Generating base map...")
     # Hack: use scatter_map on the centroids for easy clicking
@@ -40,8 +42,8 @@ def visualize_adjacency(network_file, adjacency_file):
         custom_data=["segment_id_str"], # Explicitly set for JS retrieval
         hover_data={
             "segment_id": True,
-            "successors_list": True,
-            "predecessors_list": True,
+            "successors_info": True,
+            "predecessors_info": True,
             "lat": False,
             "lon": False
         },

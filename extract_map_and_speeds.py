@@ -17,7 +17,8 @@ from scipy.spatial import KDTree
 
 sampling_interval = 1000  # 1.0Hz interpolation
 test_percentage = 0.05  # Percentage of vehicles to take in test mode
-debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "2390", "12974", "335"]
+debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "2390", "12974", "335", "1895", "1834", "10863"]
+removed_vehicles = ["2679", "2767", "2449", "456", "123", "6912", "5359","3691","5431","610", "5626","3544","6630","4993","5773","2060","5486","5875","1049","5410","4816"]
 
 def get_osm_map(edges_gdf):
     map_con = InMemMap("osm", use_latlon=False, use_rtree=True, index_edges=True)
@@ -71,6 +72,10 @@ def parse_pneuma_to_long(filepath, test=False):
             
             track_id = parts[0].strip()
             v_type = parts[1].strip()
+            
+            if track_id in removed_vehicles:
+                continue
+      
             
             if v_type == 'Motorcycle':
                 continue
@@ -552,22 +557,39 @@ def process_frenet_for_timestamp(group_data_tuple):
         ego_seg = ego['segment_id']
         ego_D = ego['D']
         ego_S = ego['t_proj'] # calculated explicitly in map matching
+        ego_az = ego['azcar']
         
         neighbors_idx = tree.query_ball_point(ego_pos, r=70) # 50m max long + 20m lat
         
         valid_neighbors = []
+        ego_adj = adjacency.get(ego_seg, {})
+        successors = ego_adj.get('successors', [])
+        predecessors = ego_adj.get('predecessors', [])
+        successor_lengths = ego_adj.get('successor_lengths', [])
+        predecessor_lengths = ego_adj.get('predecessor_lengths', [])
+
         for n_idx in neighbors_idx:
             if n_idx == ego_idx: continue
             n_row = df_group.iloc[n_idx]
             n_seg = n_row['segment_id']
             
+            # Heading Filter: Use dynamic vehicle azimuth (azcar) instead of static segment headings
+            n_az = n_row['azcar']
+            heading_diff = abs((n_az - ego_az + 180) % 360 - 180)
+            if heading_diff > 65.0:
+                continue
+
             # Topological Check
             if n_seg == ego_seg:
                 delta_S = n_row['t_proj'] - ego_S
-            elif n_seg in adjacency.get(ego_seg, {}).get('successors', []):
-                delta_S = (ego['segment_length'] - ego_S) + n_row['t_proj']
-            elif n_seg in adjacency.get(ego_seg, {}).get('predecessors', []):
-                delta_S = -ego_S - (n_row['segment_length'] - n_row['t_proj'])
+            elif n_seg in successors:
+                idx_s = successors.index(n_seg)
+                intermediate_dist = sum(successor_lengths[:idx_s])
+                delta_S = (ego['segment_length'] - ego_S) + intermediate_dist + n_row['t_proj']
+            elif n_seg in predecessors:
+                idx_p = predecessors.index(n_seg)
+                intermediate_dist = sum(predecessor_lengths[:idx_p])
+                delta_S = -ego_S - intermediate_dist - (n_row['segment_length'] - n_row['t_proj'])
             else:
                 continue
                 
@@ -579,29 +601,36 @@ def process_frenet_for_timestamp(group_data_tuple):
                 'type': n_row['type']
             })
             
-        # Zones
-        zones = {'proceeding': [], 'following': [], 'leftwards': [], 'rightwards': []}
+        # 6 Zones: Proceeding, Following, Left_Proc, Left_Foll, Right_Proc, Right_Foll
+        zones = {
+            'proceeding': [], 'following': [], 
+            'leftwards_proceeding': [], 'leftwards_following': [],
+            'rightwards_proceeding': [], 'rightwards_following': []
+        }
+        
         for n in valid_neighbors:
             dS = n['delta_S']
             dD = n['delta_D']
             v_len = 5.0 if n['type'] in ['Car', 'Taxi'] else 12.5 # approx lengths
             
-            if 0 < dS <= 50 and -1.6 <= dD <= 1.6:
-                zones['proceeding'].append((n['speed'], v_len))
-            elif -50 <= dS < 0 and -1.6 <= dD <= 1.6:
-                zones['following'].append((n['speed'], v_len))
-            elif -50 <= dS <= 50 and dD > 1.6:
-                zones['leftwards'].append((n['speed'], v_len))
-            elif -50 <= dS <= 50 and dD < -1.6:
-                zones['rightwards'].append((n['speed'], v_len))
+            if -50 <= dS <= 50:
+                if -1.6 <= dD <= 1.6:
+                    if dS > 0: zones['proceeding'].append((n['speed'], v_len))
+                    elif dS < 0: zones['following'].append((n['speed'], v_len))
+                elif dD > 1.6:
+                    if dS >= 0: zones['leftwards_proceeding'].append((n['speed'], v_len))
+                    else: zones['leftwards_following'].append((n['speed'], v_len))
+                elif dD < -1.6:
+                    if dS >= 0: zones['rightwards_proceeding'].append((n['speed'], v_len))
+                    else: zones['rightwards_following'].append((n['speed'], v_len))
                 
         ego_res = ego.to_dict()
         rem_lanes = max(1, ego['num_lanes'] - 1)
         
-        for z in ['proceeding', 'following', 'leftwards', 'rightwards']:
+        for z in zones.keys():
             if not zones[z]:
                 ego_res[f'raw_density_{z}'] = 0
-                ego_res[f'raw_speed_{z}'] = speeds.get(ego_seg, 10.0) # Impute free flow
+                ego_res[f'raw_speed_{z}'] = speeds.get(ego_seg, 10.0) 
                 ego_res[f'relative_occupancy_{z}'] = 0.0
                 ego_res[f'relative_speed_{z}'] = 1.0
             else:
@@ -613,7 +642,8 @@ def process_frenet_for_timestamp(group_data_tuple):
                 if z in ['proceeding', 'following']:
                     occ = min(1.0, occ_sum / 50.0)
                 else:
-                    occ = min(1.0, occ_sum / (100.0 * rem_lanes))
+                    # Side zones are 50m long (approx) and rem_lanes wide
+                    occ = min(1.0, occ_sum / (50.0 * rem_lanes))
                 ego_res[f'relative_occupancy_{z}'] = occ
                 
                 ego_res[f'relative_speed_{z}'] = ego_res[f'raw_speed_{z}'] / max(1.0, speeds.get(ego_seg, 10.0))
@@ -652,6 +682,18 @@ def main():
     if df.empty:
         return
         
+    # Filter segments with fewer than 10 unique vehicles
+    print("Filtering segments with low traffic volume (< 10 unique vehicles)...")
+    seg_counts = df[df['segment_id'] != ""].groupby('segment_id')['track_id'].nunique()
+    valid_segments = seg_counts[seg_counts >= 10].index
+    
+    initial_count = len(df)
+    # Keep points that are on valid segments or are not yet matched (though usually we want matched)
+    df = df[df['segment_id'].isin(valid_segments)].reset_index(drop=True)
+    
+    num_removed_segs = len(seg_counts) - len(valid_segments)
+    print(f"Removed {initial_count - len(df)} points across {num_removed_segs} low-volume segments.")
+
     output_dir = "processed_data"
     df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=args.test)
     empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir)
@@ -741,12 +783,52 @@ def main():
         'track_id', 'type', 'traveled_distance', 'avg_speed', 'lat', 'lon', 'speed', 'long_acc', 'lat_acc', 'time',
         'segment_id', 'segment_length', 'segment_type', 'num_lanes', 'lane_index', 'proportionate_distance_travelled',
         'change_in_euclidean_distance', 'relative_time_gap', 'relative_kinematic_ratio',
-        'relative_occupancy_proceeding', 'relative_occupancy_following', 'relative_occupancy_leftwards', 'relative_occupancy_rightwards',
-        'raw_density_proceeding', 'raw_density_following', 'raw_density_leftwards', 'raw_density_rightwards',
-        'segment_free_flow_speed', 'relative_ego_speed',
-        'relative_speed_proceeding', 'relative_speed_following', 'relative_speed_leftwards', 'relative_speed_rightwards',
-        'raw_speed_proceeding', 'raw_speed_following', 'raw_speed_leftwards', 'raw_speed_rightwards'
+        'segment_free_flow_speed', 'relative_ego_speed'
     ]
+    
+    for z in ['proceeding', 'following', 'leftwards_proceeding', 'leftwards_following', 'rightwards_proceeding', 'rightwards_following']:
+        out_cols.extend([f'relative_occupancy_{z}', f'raw_density_{z}', f'relative_speed_{z}', f'raw_speed_{z}'])
+    
+    final_out_path = os.path.join(output_dir, os.path.basename(input_file).replace('.csv', '_processed.csv'))
+    final_df[out_cols].to_csv(final_out_path, index=False)
+    
+    print(f"\nPipeline finished! Saved fully processed dataset to {final_out_path}")
+    print(f"Total pipeline execution completed in {time.time() - overall_start:.2f} seconds.")
+    
+    if final_df.empty:
+        print("No valid CAV features extracted. Exiting.")
+        return
+
+    # Deferred Kinematics Calculation (Calculated only for remaining CAVs)
+    print("Calculating final kinematics...")
+    kin_start = time.time()
+    
+    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(empirical_speeds).fillna(10.0)
+    final_df['relative_ego_speed'] = final_df['speed'] / final_df['segment_free_flow_speed']
+    
+    final_df = final_df.sort_values(['track_id', 'time'])
+    
+    final_df['change_in_euclidean_distance'] = final_df.groupby('track_id').apply(
+        lambda x: np.sqrt((x['x'].diff()**2) + (x['y'].diff()**2))
+    ).reset_index(level=0, drop=True)
+    
+    final_df['relative_time_gap'] = final_df.groupby('track_id')['time'].diff()
+    
+    final_df['relative_kinematic_ratio'] = final_df['change_in_euclidean_distance'] / (final_df['segment_free_flow_speed'] * final_df['relative_time_gap'])
+    final_df['relative_kinematic_ratio'] = final_df['relative_kinematic_ratio'].clip(upper=1.0)
+    
+    print(f"Kinematics took {time.time() - kin_start:.2f} seconds")
+    
+    # Export Final Fully Processed CSV
+    out_cols = [
+        'track_id', 'type', 'traveled_distance', 'avg_speed', 'lat', 'lon', 'speed', 'long_acc', 'lat_acc', 'time',
+        'segment_id', 'segment_length', 'segment_type', 'num_lanes', 'lane_index', 'proportionate_distance_travelled',
+        'change_in_euclidean_distance', 'relative_time_gap', 'relative_kinematic_ratio',
+        'segment_free_flow_speed', 'relative_ego_speed'
+    ]
+    
+    for z in ['proceeding', 'following', 'leftwards_proceeding', 'leftwards_following', 'rightwards_proceeding', 'rightwards_following']:
+        out_cols.extend([f'relative_occupancy_{z}', f'raw_density_{z}', f'relative_speed_{z}', f'raw_speed_{z}'])
     
     final_out_path = os.path.join(output_dir, os.path.basename(input_file).replace('.csv', '_processed.csv'))
     final_df[out_cols].to_csv(final_out_path, index=False)

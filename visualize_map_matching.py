@@ -16,10 +16,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         print(f"Error: Trajectory file {trajectory_file} not found. Run extract_map_and_speeds.py first.")
         return
 
-    edges = gpd.read_file(network_file)
-    if edges.crs != "EPSG:4326":
-        edges = edges.to_crs("EPSG:4326")
-        
+    # Load trajectories first to know the spatial extent and unique segments
     df = pd.read_csv(trajectory_file)
     
     if not test:
@@ -27,13 +24,31 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         unique_tracks = df['track_id'].unique()
         n_sample = max(1, int(len(unique_tracks) * 0.15))
         sampled_tracks = np.random.choice(unique_tracks, n_sample, replace=False)
-        df = df[df['track_id'].isin(sampled_tracks)]
+        df = df[df['track_id'].isin(sampled_tracks)].copy()
     else:
         print("Test mode: visualizing all trajectory points.")
+        df = df.copy()
 
-    edges['segment_id_str'] = edges['segment_id'].astype(str)
-    
+    # Optimization: Assign 10 colors randomly and iteratively to vehicles
+    unique_tracks = df['track_id'].unique()
+    np.random.shuffle(unique_tracks)
+    track_to_color = {tid: str(i % 10) for i, tid in enumerate(unique_tracks)}
+    df['assigned_color'] = df['track_id'].map(track_to_color)
     df['track_id_str'] = df['track_id'].astype(str)
+    
+    # Generate 10 nice rainbow colors
+    rainbow_palette = px.colors.sample_colorscale('turbo', np.linspace(0, 1, 10))
+
+    # Load and optimize network data
+    edges = gpd.read_file(network_file)
+    if edges.crs != "EPSG:4326":
+        edges = edges.to_crs("EPSG:4326")
+    
+    # Spatial pruning: Only keep roads within the bounding box of our trajectories
+    print("Pruning network to trajectory bounds...")
+    min_lon, min_lat, max_lon, max_lat = df['lon'].min(), df['lat'].min(), df['lon'].max(), df['lat'].max()
+    buffer = 0.005 # ~500m buffer
+    edges = edges.cx[min_lon-buffer:max_lon+buffer, min_lat-buffer:max_lat+buffer].copy()
     
     print("Generating base map...")
     
@@ -42,8 +57,8 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         df,
         lat="lat",
         lon="lon",
-        color="track_id_str",
-        custom_data=["segment_id"], # For JS highlighting
+        color="assigned_color", # 10 traces instead of N
+        color_discrete_sequence=rainbow_palette,
         hover_data={
             "track_id": True,
             "type": True,
@@ -56,6 +71,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
             "t_proj": ":.2f",
             "prop_dist": ":.3f",
             "rel_heading": ":.2f",
+            "assigned_color": False,
             "lat": False,
             "lon": False
         },
@@ -63,9 +79,17 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         height=800,
         title=f"Map Matching Visualization ({'All' if test else '15% Sampled'} Vehicles)"
     )
-    fig.update_layout(showlegend=False)
+    
+    fig.update_layout(
+        showlegend=False,
+        margin=dict(l=0, r=0, t=40, b=0)
+    )
+    fig.update_maps(
+        pitch=0,        # Lock to 2D
+        bearing=0,      # No rotation
+    )
 
-    # Add ALL road lines as a faint background layer
+    # Add filtered road lines as a faint background layer
     lats = []
     lons = []
     for geom in edges.geometry:
@@ -83,7 +107,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         lat=lats,
         lon=lons,
         mode='lines',
-        line=dict(width=2, color='rgba(100, 100, 100, 0.2)'),
+        line=dict(width=1.5, color='rgba(150, 150, 150, 0.3)'),
         hoverinfo='skip',
         showlegend=False
     )
@@ -91,84 +115,16 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
     
     # Reorder: roads at bottom
     data_list = list(fig.data)
-    # Background roads should be first so points are on top
     fig.data = (data_list[-1], *data_list[:-1])
 
-    print("Preparing interactive HTML...")
-    
-    # Map of segment_id -> coords for JS
-    geo_map = {}
-    for _, row in edges.iterrows():
-        coords = []
-        if row.geometry.geom_type == 'LineString':
-            coords = [[y, x] for x, y in zip(*row.geometry.xy)]
-        elif row.geometry.geom_type == 'MultiLineString':
-            for line in row.geometry.geoms:
-                coords.extend([[y, x] for x, y in zip(*line.xy)])
-                coords.append([None, None])
-        geo_map[row['segment_id_str']] = coords
-
     html_file = "map_matching_viz.html"
-    base_html = fig.to_html(include_plotlyjs="cdn", full_html=True)
-    
-    js_injection = f"""
-    <script>
-        var geoMap = {json.dumps(geo_map)};
-        
-        document.addEventListener('DOMContentLoaded', function() {{
-            var plotEl = document.getElementsByClassName('plotly-graph-div')[0];
-            
-            plotEl.on('plotly_click', function(data){{
-                if(data.points.length > 0) {{
-                    var segId = data.points[0].customdata[0];
-                    console.log("Clicked Trajectory Point on Segment:", segId);
-                    highlightSegment(segId, plotEl);
-                }}
-            }});
-        }});
-
-        function highlightSegment(segId, plotEl) {{
-            var segIdStr = String(segId);
-            
-            var traces = [];
-            
-            if (geoMap[segIdStr]) {{
-                traces.push({{
-                    type: 'scattermap',
-                    lat: geoMap[segIdStr].map(p => p[0]),
-                    lon: geoMap[segIdStr].map(p => p[1]),
-                    mode: 'lines',
-                    line: {{width: 6, color: 'cyan'}},
-                    name: 'Matched Segment: ' + segIdStr
-                }});
-            }}
-
-            // Remove previous highlight traces (indices starting after the original data)
-            // Original data has 1 road trace + N vehicle type traces
-            var originalTraceCount = {len(fig.data)};
-            var currentTracesCount = plotEl.data.length;
-            var indicesToRemove = [];
-            for (var i = originalTraceCount; i < currentTracesCount; i++) indicesToRemove.push(i);
-            
-            if (indicesToRemove.length > 0) {{
-                Plotly.deleteTraces(plotEl, indicesToRemove);
-            }}
-            
-            Plotly.addTraces(plotEl, traces);
-        }}
-    </script>
-    </body>
-    </html>
-    """
-    
-    final_html = base_html.replace('</body>\n</html>', js_injection)
-    
-    with open(html_file, 'w', encoding='utf-8') as f:
-        f.write(final_html)
+    print(f"Saving to {html_file}...")
+    fig.write_html(html_file, include_plotlyjs="cdn")
 
     print(f"Opening {html_file} in your default web browser...")
     import webbrowser
     webbrowser.open('file://' + os.path.realpath(html_file))
+
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize map-matched trajectory points.")
