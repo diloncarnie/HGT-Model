@@ -42,6 +42,7 @@ def visualize_adjacency(network_file, adjacency_file):
         custom_data=["segment_id_str"], # Explicitly set for JS retrieval
         hover_data={
             "segment_id": True,
+            "highway": True,
             "successors_info": True,
             "predecessors_info": True,
             "lat": False,

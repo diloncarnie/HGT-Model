@@ -128,7 +128,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize map-matched trajectory points.")
-    parser.add_argument('--network', default='osm_network.gpkg', help="Path to osm_network.gpkg")
+    parser.add_argument('--network', default='processed_data/osm_network.gpkg', help="Path to osm_network.gpkg")
     parser.add_argument('--trajectories', default='processed_data/matched_trajectories.csv', help="Path to matched_trajectories.csv")
     parser.add_argument('--all', action='store_true', help="Visualize all points (no sampling)")
     args = parser.parse_args()

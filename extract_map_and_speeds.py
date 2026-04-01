@@ -18,7 +18,9 @@ from scipy.spatial import KDTree
 sampling_interval = 1000  # 1.0Hz interpolation
 test_percentage = 0.05  # Percentage of vehicles to take in test mode
 debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "2390", "12974", "335", "1895", "1834", "10863"]
-removed_vehicles = ["2679", "2767", "2449", "456", "123", "6912", "5359","3691","5431","610", "5626","3544","6630","4993","5773","2060","5486","5875","1049","5410","4816"]
+#removed_vehicles = ["2679", "2767", "2449", "456", "123", "6912", "5359","3691","5431","610", "5626","3544","6630","4993","5773","2060","5486","5875","1049","5410","4816", "3789","485","1216","2256","4966","236","5214","3403", "1311", "1339","1292","665","664","5217","7073","6378","3085","4923","3243"]
+removed_vehicles = []
+removed_segments = ["1770","1797","1784","1800","14486","1835","1747","1904","1905","1917","1897","1757","1794","2389","337","287","329","455","10955","10861","10854"]
 
 def get_osm_map(edges_gdf):
     map_con = InMemMap("osm", use_latlon=False, use_rtree=True, index_edges=True)
@@ -315,11 +317,13 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
         if seg_id == "": continue
 
         d_vals = group['signed_dist'].values
-        # Use 99th percentile for robust road width estimation
-        abs_max_d = np.percentile(d_vals, 98)
+        # Use 98th and 2nd percentiles for robust road width estimation
+        abs_max_d = np.percentile(d_vals, 99)
+        abs_min_d = np.percentile(d_vals, 1)
+        road_width = abs_max_d - abs_min_d
 
-        # D = Max_Distance - Vehicle_Distance
-        df.loc[group.index, 'D'] = (abs_max_d - group['signed_dist']).clip(lower=0.0)
+        # D = Right_Edge - Vehicle_Distance. Clip extreme outliers on both sides.
+        df.loc[group.index, 'D'] = (abs_max_d - group['signed_dist']).clip(0.0, road_width)
         D_vals = df.loc[group.index, 'D'].values
 
         num_lanes_osm = int(group['num_lanes'].iloc[0])
@@ -371,7 +375,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                         valid = True
                         for i in range(1, len(breaks)):
                             width = breaks[i] - breaks[i-1]
-                            if width < 1.6 or width > 4.0:
+                            if width < 1.6 or width > 4.5:
                                 valid = False
                                 break
                         if valid:
@@ -398,7 +402,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                         valid = True
                         for i in range(1, len(breaks)):
                             width = breaks[i] - breaks[i-1]
-                            if width < 2.5 or width > 4.0:
+                            if width < 1.75 or width > 4.5:
                                 valid = False
                                 break
                         if valid:
@@ -420,7 +424,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                             valid = True
                             for i in range(1, len(breaks)):
                                 width = breaks[i] - breaks[i-1]
-                                if width < 2.0 or width > 4.0:
+                                if width < 1.75 or width > 4.5:
                                     valid = False
                                     break
                             if valid:
@@ -682,19 +686,29 @@ def main():
     if df.empty:
         return
         
-    # Filter segments with fewer than 10 unique vehicles
-    print("Filtering segments with low traffic volume (< 10 unique vehicles)...")
+    # Filter segments with fewer than 10 unique vehicles or in removed_segments
+    print(f"Filtering segments (Min 10 vehicles, Exclude blacklist: {len(removed_segments)})...")
     seg_counts = df[df['segment_id'] != ""].groupby('segment_id')['track_id'].nunique()
-    valid_segments = seg_counts[seg_counts >= 10].index
+    
+    # Identify segments that meet the volume threshold AND are not in the blacklist
+    valid_segments = [s for s in seg_counts.index if s not in removed_segments and seg_counts[s] >= 10]
     
     initial_count = len(df)
-    # Keep points that are on valid segments or are not yet matched (though usually we want matched)
     df = df[df['segment_id'].isin(valid_segments)].reset_index(drop=True)
     
     num_removed_segs = len(seg_counts) - len(valid_segments)
-    print(f"Removed {initial_count - len(df)} points across {num_removed_segs} low-volume segments.")
+    print(f"Removed {initial_count - len(df)} points across {num_removed_segs} segments (low volume or blacklisted).")
 
     output_dir = "processed_data"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Export filtered road network
+    filtered_network_path = os.path.join(output_dir, 'osm_network.gpkg')
+    print(f"Exporting filtered road network to {filtered_network_path}...")
+    # Ensure IDs are compared as strings to match valid_segments list
+    filtered_edges = edges_gdf[edges_gdf['segment_id'].astype(str).isin(valid_segments)]
+    filtered_edges.to_file(filtered_network_path, driver='GPKG')
+
     df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=args.test)
     empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir)
     
@@ -724,16 +738,14 @@ def main():
         print("Error: topological_adjacency.json not found. Make sure to run the external OSM downloader script.")
         return
         
-    # Stratified Sampling (15% of CAVs per 5-minute bin)
-    print("Performing stratified sampling (15% CAVs per 5-minute bin)...")
-    df['time_bin'] = (df['time'] // 300) * 300
+    # Sampling 15% of all unique Car/Taxi tracks as CAVs
+    print("Sampling 15% of unique Car/Taxi tracks as CAVs...")
     df['is_CAV'] = False
-    
-    for _, group in df[df['type'].isin(['Car', 'Taxi'])].groupby('time_bin'):
-        unique_tracks = group['track_id'].unique()
-        n_sample = max(1, int(len(unique_tracks) * 0.15))
-        sampled = np.random.choice(unique_tracks, n_sample, replace=False)
-        df.loc[df['track_id'].isin(sampled), 'is_CAV'] = True
+    unique_tracks = df[df['type'].isin(['Car', 'Taxi'])]['track_id'].unique()
+    n_sample = max(1, int(len(unique_tracks) * 0.15))
+    sampled_cavs = np.random.choice(unique_tracks, n_sample, replace=False)
+    df.loc[df['track_id'].isin(sampled_cavs), 'is_CAV'] = True
+    print(f"Total CAVs selected: {len(sampled_cavs)} out of {len(unique_tracks)} unique Car/Taxi vehicles.")
         
     # Frenet Ego-Centric Extraction
     print("Extracting spatial features via KDTree (using 1-second time buckets)...")
@@ -753,47 +765,6 @@ def main():
     
     final_df = pd.concat([r for r in results if not r.empty], ignore_index=True)
     print(f"Feature extraction took {time.time() - kdtree_start:.2f} seconds")
-    
-    if final_df.empty:
-        print("No valid CAV features extracted. Exiting.")
-        return
-
-    # Deferred Kinematics Calculation (Calculated only for remaining CAVs)
-    print("Calculating final kinematics...")
-    kin_start = time.time()
-    
-    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(empirical_speeds).fillna(10.0)
-    final_df['relative_ego_speed'] = final_df['speed'] / final_df['segment_free_flow_speed']
-    
-    final_df = final_df.sort_values(['track_id', 'time'])
-    
-    final_df['change_in_euclidean_distance'] = final_df.groupby('track_id').apply(
-        lambda x: np.sqrt((x['x'].diff()**2) + (x['y'].diff()**2))
-    ).reset_index(level=0, drop=True)
-    
-    final_df['relative_time_gap'] = final_df.groupby('track_id')['time'].diff()
-    
-    final_df['relative_kinematic_ratio'] = final_df['change_in_euclidean_distance'] / (final_df['segment_free_flow_speed'] * final_df['relative_time_gap'])
-    final_df['relative_kinematic_ratio'] = final_df['relative_kinematic_ratio'].clip(upper=1.0)
-    
-    print(f"Kinematics took {time.time() - kin_start:.2f} seconds")
-    
-    # Export Final Fully Processed CSV
-    out_cols = [
-        'track_id', 'type', 'traveled_distance', 'avg_speed', 'lat', 'lon', 'speed', 'long_acc', 'lat_acc', 'time',
-        'segment_id', 'segment_length', 'segment_type', 'num_lanes', 'lane_index', 'proportionate_distance_travelled',
-        'change_in_euclidean_distance', 'relative_time_gap', 'relative_kinematic_ratio',
-        'segment_free_flow_speed', 'relative_ego_speed'
-    ]
-    
-    for z in ['proceeding', 'following', 'leftwards_proceeding', 'leftwards_following', 'rightwards_proceeding', 'rightwards_following']:
-        out_cols.extend([f'relative_occupancy_{z}', f'raw_density_{z}', f'relative_speed_{z}', f'raw_speed_{z}'])
-    
-    final_out_path = os.path.join(output_dir, os.path.basename(input_file).replace('.csv', '_processed.csv'))
-    final_df[out_cols].to_csv(final_out_path, index=False)
-    
-    print(f"\nPipeline finished! Saved fully processed dataset to {final_out_path}")
-    print(f"Total pipeline execution completed in {time.time() - overall_start:.2f} seconds.")
     
     if final_df.empty:
         print("No valid CAV features extracted. Exiting.")
