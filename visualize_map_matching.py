@@ -85,6 +85,17 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         margin=dict(l=0, r=0, t=40, b=0)
     )
     fig.update_maps(
+        style="white-bg",
+        layers=[
+            {
+                "below": 'traces',
+                "sourcetype": "raster",
+                "sourceattribution": "Esri",
+                "source": [
+                    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                ]
+            }
+        ],
         pitch=0,        # Lock to 2D
         bearing=0,      # No rotation
     )
@@ -102,12 +113,12 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
                 x, y = line.xy
                 lats.extend(list(y) + [None])
                 lons.extend(list(x) + [None])
-    
+
     bg_roads = go.Scattermap(
         lat=lats,
         lon=lons,
         mode='lines',
-        line=dict(width=1.5, color='rgba(150, 150, 150, 0.3)'),
+        line=dict(width=1.5, color='rgba(255, 255, 255, 0.4)'),
         hoverinfo='skip',
         showlegend=False
     )

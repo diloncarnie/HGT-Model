@@ -17,10 +17,23 @@ from scipy.spatial import KDTree
 
 sampling_interval = 1000  # 1.0Hz interpolation
 test_percentage = 0.05  # Percentage of vehicles to take in test mode
-debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "2390", "12974", "335", "1895", "1834", "10863"]
-#removed_vehicles = ["2679", "2767", "2449", "456", "123", "6912", "5359","3691","5431","610", "5626","3544","6630","4993","5773","2060","5486","5875","1049","5410","4816", "3789","485","1216","2256","4966","236","5214","3403", "1311", "1339","1292","665","664","5217","7073","6378","3085","4923","3243"]
+debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "12974", "335", "1895", "1834", "10863"]
 removed_vehicles = []
-removed_segments = ["1770","1797","1784","1800","14486","1835","1747","1904","1905","1917","1897","1757","1794","2389","337","287","329","455","10955","10861","10854"]
+removed_segments = ["1770","1797","1784","1800","14486","1835","1747","1904","1905","1917","1897","1757","1794",
+                    "2389","337","287","329","455","10955","10861","10854", "2390","12601","81","82","338","160","2248","14465","14389","10880","256","260","190","12976","286","82","159","161","160","159","214","286"]
+
+fixed_segments = {  "0":3,"3":3,
+                    "165":2,"177":3,"199":3,"243":2,"299":3,"291":3,"293":3,"296":3,"399":3,"210":2,"211":3,"226":3,"240":2,"285":2,"290":3,"298":4,"300":4,"325":3,"335":2,"389":3,
+                    "1801":5,"1802":3,"1803":3,
+                    "2228":3, "2229":3, "2250":4,
+                    "1748":3,"1750":4,"1751":3,"1753":3,"1756":3,"1759":3,"1760":5,"1764":3,"1766":4,"1768":4,"1769":5,"1771":3,"1772":3,"1793":4,"1798":3,"1799":3,
+                    "1804":3,"1828": 5,"1834": 4,"1836":4,"1837":5,"1839":5,"1848":4,"1849":3,"1851":3,"1855":3,"1895":3,"1896":3,"1899":3,
+                    "1902":3, "1903":3, "1906":4, "1908":2, "1909":4,
+                    "6579":4,
+                    "10869":3,"10863":3,"10855":3,"10858":3,"10862":3,"10865":3,"10872":4,"10874":3,"10882":3,"10956":5,
+                    "12974":4,"12975":3,
+                    "13064":4,"13232":4,"13803":5,"13869":3,"13871":3,
+                    "14317":3,"14346":3}
 
 def get_osm_map(edges_gdf):
     map_con = InMemMap("osm", use_latlon=False, use_rtree=True, index_edges=True)
@@ -263,6 +276,25 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_
         group_results['rel_heading'] = rel_headings
         group_results['highway'] = highways_list
         group_results['t_proj'] = t_projs
+        
+        # Filter out points with relative heading > 45 degrees
+        group_results = group_results[group_results['rel_heading'] <= 45.0].copy()
+        
+        if group_results.empty:
+            continue
+            
+        # Filter out partial traversals (traversed < 80% of the segment length)
+        # Skip this filter for segments shorter than 25 meters to avoid pruning fast traversals
+        def is_fully_traversed(group):
+            if group['segment_length'].iloc[0] < 30.0:
+                return True
+            return (group['prop_dist'].max() - group['prop_dist'].min()) >= 0.75
+
+        valid_traversals = group_results.groupby('segment_id').filter(is_fully_traversed)
+        group_results = valid_traversals.copy()
+        
+        if group_results.empty:
+            continue
                 
         matched_results.append(group_results)
         
@@ -310,6 +342,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
     # Process Jenks
     lane_boundaries = {}
     jenks_segments_used = []
+    failed_segments = []
 
     grouped = df.groupby('segment_id')
 
@@ -318,8 +351,8 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
 
         d_vals = group['signed_dist'].values
         # Use 98th and 2nd percentiles for robust road width estimation
-        abs_max_d = np.percentile(d_vals, 99)
-        abs_min_d = np.percentile(d_vals, 1)
+        abs_max_d = np.percentile(d_vals, 98)
+        abs_min_d = np.percentile(d_vals, 2)
         road_width = abs_max_d - abs_min_d
 
         # D = Right_Edge - Vehicle_Distance. Clip extreme outliers on both sides.
@@ -367,7 +400,23 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
             initial_k = max(1, round(max_distance / avg_lane_width))
 
             best_breaks = None
-            if initial_k == 1:
+            if seg_id in fixed_segments:
+                k = fixed_segments[seg_id]
+                if k == 1:
+                    best_breaks = [road_min, road_max]
+                    if test:
+                        print(f"Segment {seg_id}: Manual override applied. Assigned 1 lane [road_min, road_max].")
+                else:
+                    try:
+                        best_breaks = jenkspy.jenks_breaks(sample, n_classes=k)
+                        if test:
+                            print(f"Segment {seg_id}: Manual override applied. Assigned {k} lanes using Jenks.")
+                    except ValueError:
+                        best_breaks = [road_min + i * (max_distance / k) for i in range(k + 1)]
+                        failed_segments.append(seg_id)
+                        if test:
+                            print(f"Segment {seg_id}: Manual override applied. Jenks failed, using equal widths for {k} lanes.")
+            elif initial_k == 1:
                 # Informed decision for 1 lane: Try Jenks for 2 or 3 lanes.
                 for k in [2, 3]:
                     try:
@@ -443,12 +492,19 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                 try:
                     lane_boundaries[seg_id] = jenkspy.jenks_breaks(sample, n_classes=initial_k)
                     jenks_segments_used.append(seg_id)
+                    failed_segments.append(seg_id)
                     if test:
                         print(f"Segment {seg_id}: Jenks failed to find valid breaks. Used initial guess with {initial_k} lanes.")
                 except ValueError:
                     lane_boundaries[seg_id] = [road_min + i * avg_lane_width for i in range(initial_k + 1)]
         else:
-            lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes_osm + 1)]
+            if seg_id in fixed_segments:
+                num_lanes_fixed = fixed_segments[seg_id]
+                lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes_fixed + 1)]
+                if test:
+                    print(f"Segment {seg_id}: Manual override applied. Assigned {num_lanes_fixed} lanes (low sample fallback).")
+            else:
+                lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes_osm + 1)]
 
     # Lane Assignment and Outlier Removal
     df['lane_index'] = 0
@@ -493,7 +549,15 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
         json.dump(lane_boundaries, f, indent=4)        
     
     # Plot debug histograms for specific segments
-    for seg in debug_segments:
+    debug_dir = os.path.join(output_dir, 'debugged_segments')
+    failed_dir = os.path.join(debug_dir, 'failed_segments')
+    os.makedirs(debug_dir, exist_ok=True)
+    os.makedirs(failed_dir, exist_ok=True)
+    
+    segments_to_plot = set(debug_segments).union(set(failed_segments))
+    print(f"Number of failed segments to plot: {len(failed_segments)}.")
+    
+    for seg in segments_to_plot:
         if seg in lane_boundaries:
             plt.figure(figsize=(8,4))
             seg_group = df[df['segment_id'] == seg]
@@ -505,7 +569,13 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
             plt.title(f'Lane Boundaries for Segment {seg} (Detected Lanes: {n_lanes})')
             plt.xlabel('Distance from Right Edge (m)')
             plt.ylabel('Frequency')
-            plt.savefig(os.path.join(output_dir, f'histogram_seg_{seg}.png'))
+            
+            if seg in failed_segments:
+                save_path = os.path.join(failed_dir, f'histogram_seg_{seg}.png')
+            else:
+                save_path = os.path.join(debug_dir, f'histogram_seg_{seg}.png')
+                
+            plt.savefig(save_path)
             plt.close()
             print(f"Generated debug histogram for segment {seg}.")
         
@@ -656,26 +726,9 @@ def process_frenet_for_timestamp(group_data_tuple):
         
     return pd.DataFrame(results)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('input_path', help="Path to a single pNEUMA CSV file or directory")
-    parser.add_argument('--test', action='store_true', help="Test mode (only 15 vehicles)")
-    args = parser.parse_args()
-    
-    overall_start = time.time()
-    
-    if os.path.isdir(args.input_path):
-        files = [os.path.join(args.input_path, f) for f in os.listdir(args.input_path) if f.endswith('.csv')]
-        input_file = files[0] if files else None
-    else:
-        input_file = args.input_path
-        
-    if not input_file:
-        print("No CSV file found.")
-        return
-        
-    print("Loading OSM network...")
-    edges_gdf = gpd.read_file('osm_network.gpkg')
+def process_single_file(input_file, edges_gdf, args):
+    print(f"\n--- Processing {input_file} ---")
+    file_start_time = time.time()
     
     df = parse_pneuma_to_long(input_file, test=args.test)
     if df.empty:
@@ -699,7 +752,8 @@ def main():
     num_removed_segs = len(seg_counts) - len(valid_segments)
     print(f"Removed {initial_count - len(df)} points across {num_removed_segs} segments (low volume or blacklisted).")
 
-    output_dir = "processed_data"
+    file_name = os.path.splitext(os.path.basename(input_file))[0]
+    output_dir = os.path.join("processed_data", file_name)
     os.makedirs(output_dir, exist_ok=True)
     
     # Export filtered road network
@@ -804,8 +858,33 @@ def main():
     final_out_path = os.path.join(output_dir, os.path.basename(input_file).replace('.csv', '_processed.csv'))
     final_df[out_cols].to_csv(final_out_path, index=False)
     
-    print(f"\nPipeline finished! Saved fully processed dataset to {final_out_path}")
-    print(f"Total pipeline execution completed in {time.time() - overall_start:.2f} seconds.")
+    print(f"\nFinished processing {input_file}! Saved to {final_out_path}")
+    print(f"Execution for this file took {time.time() - file_start_time:.2f} seconds.")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('input_path', help="Path to a single pNEUMA CSV file or directory")
+    parser.add_argument('--test', action='store_true', help="Test mode (only 15 vehicles)")
+    args = parser.parse_args()
+    
+    overall_start = time.time()
+    
+    if os.path.isdir(args.input_path):
+        files = sorted([os.path.join(args.input_path, f) for f in os.listdir(args.input_path) if f.endswith('.csv')])
+    else:
+        files = [args.input_path]
+        
+    if not files:
+        print("No CSV file(s) found.")
+        return
+        
+    print("Loading OSM network...")
+    edges_gdf = gpd.read_file('osm_network.gpkg')
+    
+    for input_file in files:
+        process_single_file(input_file, edges_gdf, args)
+
+    print(f"\nTotal pipeline execution completed in {time.time() - overall_start:.2f} seconds.")
 
 if __name__ == '__main__':
     main()
