@@ -7,13 +7,13 @@ import os
 import json
 import numpy as np
 
-def visualize_processed_pipeline(network_file, processed_file, show_all=False, time_window=5.0):
+def visualize_processed_pipeline(network_file, input_path, show_all=False, time_window=1.0):
     print(f"Loading data...")
     if not os.path.exists(network_file):
         print(f"Error: Network file {network_file} not found.")
         return
-    if not os.path.exists(processed_file):
-        print(f"Error: Processed file {processed_file} not found. Run the pipeline first.")
+    if not os.path.exists(input_path):
+        print(f"Error: Input path {input_path} not found. Run the pipeline first.")
         return
 
     # Load Road Network for context
@@ -21,33 +21,94 @@ def visualize_processed_pipeline(network_file, processed_file, show_all=False, t
     if edges.crs != "EPSG:4326":
         edges = edges.to_crs("EPSG:4326")
 
-    df = pd.read_csv(processed_file)
-    
-    # Identify ALL processed vehicles before any sampling to filter background data correctly
-    all_processed_vehicles = df['track_id'].unique()
+    processed_dfs = []
+    matched_dfs = []
+
+    # Handle directory vs single file
+    if os.path.isdir(input_path):
+        print(f"Directory detected. Loading sequential data from {input_path}...")
+        subfolders = sorted([f for f in os.listdir(input_path) if os.path.isdir(os.path.join(input_path, f))])
+        
+        cumulative_time_offset = 0.0
+        
+        for folder_name in subfolders:
+            subdir = os.path.join(input_path, folder_name)
+            
+            # Find processed file
+            proc_file = os.path.join(subdir, f"{folder_name}_processed.csv")
+            if not os.path.exists(proc_file):
+                proc_files = [f for f in os.listdir(subdir) if f.endswith('_processed.csv')]
+                if proc_files:
+                    proc_file = os.path.join(subdir, proc_files[0])
+            
+            if os.path.exists(proc_file):
+                print(f"  Loading {proc_file}...")
+                df_p = pd.read_csv(proc_file)
+                all_processed = df_p['track_id'].unique()
+                
+                # Make track_id globally unique across sequential files
+                df_p['track_id'] = df_p['track_id'].astype(str) + f"_{folder_name}"
+                
+                # Load matched trajectories
+                match_file = os.path.join(subdir, 'matched_trajectories.csv')
+                if os.path.exists(match_file):
+                    print(f"  Loading {match_file}...")
+                    df_m = pd.read_csv(match_file, usecols=['track_id', 'time', 'lat', 'lon'])
+                    # Filter out processed vehicles for this specific folder
+                    df_m = df_m[~df_m['track_id'].isin(all_processed)]
+                    df_m['track_id'] = df_m['track_id'].astype(str) + f"_{folder_name}"
+                else:
+                    df_m = pd.DataFrame()
+                    
+                # Find max time in the current folder to offset the NEXT folder
+                max_p_time = df_p['time'].max() if not df_p.empty else 0.0
+                max_m_time = df_m['time'].max() if not df_m.empty else 0.0
+                folder_max_time = max(max_p_time, max_m_time)
+                
+                # Shift timestamps
+                if not df_p.empty:
+                    df_p['time'] += cumulative_time_offset
+                    processed_dfs.append(df_p)
+                    
+                if not df_m.empty:
+                    df_m['time'] += cumulative_time_offset
+                    matched_dfs.append(df_m)
+                    
+                if folder_max_time > 0:
+                    cumulative_time_offset += folder_max_time
+                    
+        if not processed_dfs:
+            print(f"Error: No processed CSV files found in subdirectories of {input_path}.")
+            return
+            
+        df = pd.concat(processed_dfs, ignore_index=True)
+        df_matched = pd.concat(matched_dfs, ignore_index=True) if matched_dfs else pd.DataFrame()
+        
+    else:
+        print(f"Loading data from {input_path}...")
+        df = pd.read_csv(input_path)
+        all_processed = df['track_id'].unique()
+        df['track_id'] = df['track_id'].astype(str) # Ensure string format
+        
+        matched_file = os.path.join(os.path.dirname(input_path), 'matched_trajectories.csv')
+        if not os.path.exists(matched_file):
+            print(f"Warning: matched_trajectories.csv not found at {matched_file}. Grey points will not be shown.")
+            df_matched = pd.DataFrame()
+        else:
+            print(f"Loading matched trajectories from {matched_file}...")
+            df_matched = pd.read_csv(matched_file, usecols=['track_id', 'time', 'lat', 'lon'])
+            # Filter out processed vehicles
+            df_matched = df_matched[~df_matched['track_id'].isin(all_processed)]
+            df_matched['track_id'] = df_matched['track_id'].astype(str)
 
     # ----------------------------------------------------
-    # Load additional matched trajectories for grey points
+    # Downsample matched trajectories for grey points
     # ----------------------------------------------------
-    matched_file = os.path.join(os.path.dirname(processed_file), 'matched_trajectories.csv')
-    if not os.path.exists(matched_file):
-        print(f"Warning: matched_trajectories.csv not found at {matched_file}. Grey points will not be shown.")
-        df_matched = pd.DataFrame()
-    else:
-        print(f"Loading matched trajectories from {matched_file}...")
-        # Only need specific columns to reduce memory load
-        df_matched = pd.read_csv(matched_file, usecols=['track_id', 'time', 'lat', 'lon'])
-        
-        # Filter out vehicles that are in processed.csv
-        df_matched = df_matched[~df_matched['track_id'].isin(all_processed_vehicles)]
-        
-        # Group by time window
+    if not df_matched.empty:
         df_matched['time_window_sec'] = (df_matched['time'] // time_window) * time_window
         
-        # Sampling logic for background trajectories
         if not show_all:
             unique_matched = df_matched['track_id'].unique()
-            # Sample 10% for performance when not using --all
             n_sample_matched = max(1, int(len(unique_matched) * 0.10))
             print(f"Sampling 10% of background trajectories ({n_sample_matched} vehicles)...")
             sampled_matched = np.random.choice(unique_matched, n_sample_matched, replace=False)
@@ -55,7 +116,6 @@ def visualize_processed_pipeline(network_file, processed_file, show_all=False, t
         else:
             print("Visualizing 100% of background trajectories.")
 
-        # Downsample to 1 point per vehicle per frame for performance
         print("Downsampling matched trajectories (grey points)...")
         df_matched = df_matched.groupby(['time_window_sec', 'track_id']).first().reset_index()
         df_matched['time_window_str'] = df_matched['time_window_sec'].astype(int).astype(str) + "s"
@@ -63,6 +123,7 @@ def visualize_processed_pipeline(network_file, processed_file, show_all=False, t
     # ----------------------------------------------------
     # Process CAV Data
     # ----------------------------------------------------
+    all_processed_vehicles = df['track_id'].unique()
     if not show_all:
         n_sample = max(1, int(len(all_processed_vehicles) * 0.25)) 
         print(f"Sampling 25% of CAVs ({n_sample} vehicles)...")
