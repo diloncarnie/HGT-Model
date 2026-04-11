@@ -317,9 +317,9 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize processed pipeline CAV features.")
-    parser.add_argument('--network', default='processed_data/osm_network.gpkg', help="Path to osm_network.gpkg")
+    parser.add_argument('--network', default='osm_network_merged.gpkg', help="Path to osm_network.gpkg")
     parser.add_argument('--time_window', type=float, default=5.0, help="Size of the timeline bucket in seconds (default: 5.0)")
-    parser.add_argument('input', nargs='?', help="Path to the _processed.csv file")       
+    parser.add_argument('--input', nargs='?', help="Path to the _processed.csv file")       
     parser.add_argument('--all', action='store_true', help="Visualize all points (no sampling)")
     args = parser.parse_args()
 

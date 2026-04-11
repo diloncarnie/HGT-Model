@@ -26,7 +26,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         sampled_tracks = np.random.choice(unique_tracks, n_sample, replace=False)
         df = df[df['track_id'].isin(sampled_tracks)].copy()
     else:
-        print("Test mode: visualizing all trajectory points.")
+        print("Visualizing all trajectory points.")
         df = df.copy()
 
     # Optimization: Assign 10 colors randomly and iteratively to vehicles
@@ -45,10 +45,10 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         edges = edges.to_crs("EPSG:4326")
     
     # Spatial pruning: Only keep roads within the bounding box of our trajectories
-    print("Pruning network to trajectory bounds...")
-    min_lon, min_lat, max_lon, max_lat = df['lon'].min(), df['lat'].min(), df['lon'].max(), df['lat'].max()
-    buffer = 0.005 # ~500m buffer
-    edges = edges.cx[min_lon-buffer:max_lon+buffer, min_lat-buffer:max_lat+buffer].copy()
+    # print("Pruning network to trajectory bounds...")
+    # min_lon, min_lat, max_lon, max_lat = df['lon'].min(), df['lat'].min(), df['lon'].max(), df['lat'].max()
+    # buffer = 0.005 # ~500m buffer
+    # edges = edges.cx[min_lon-buffer:max_lon+buffer, min_lat-buffer:max_lat+buffer].copy()
     
     print("Generating base map...")
     
@@ -139,8 +139,8 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize map-matched trajectory points.")
-    parser.add_argument('--network', default='processed_data/osm_network.gpkg', help="Path to osm_network.gpkg")
-    parser.add_argument('--trajectories', default='processed_data/matched_trajectories.csv', help="Path to matched_trajectories.csv")
+    parser.add_argument('--network', default='osm_network_merged.gpkg', help="Path to osm_network.gpkg")
+    parser.add_argument('--trajectories', help="Path to matched_trajectories.csv")
     parser.add_argument('--all', action='store_true', help="Visualize all points (no sampling)")
     args = parser.parse_args()
     

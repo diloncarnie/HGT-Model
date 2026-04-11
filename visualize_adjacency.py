@@ -42,6 +42,7 @@ def visualize_adjacency(network_file, adjacency_file):
         custom_data=["segment_id_str"], # Explicitly set for JS retrieval
         hover_data={
             "segment_id": True,
+            "length": True,
             "highway": True,
             "successors_info": True,
             "predecessors_info": True,
@@ -100,7 +101,10 @@ def visualize_adjacency(network_file, adjacency_file):
     base_html = fig.to_html(include_plotlyjs="cdn", full_html=True)
     
     # Fix JS injection with correct syntax and robust data lookup
-    js_injection = f"""
+    js_injection = f"""<div style="padding: 10px; text-align: center; font-family: sans-serif;">
+        <input type="text" id="segIdInput" placeholder="Enter Segment ID" style="padding: 5px; width: 200px;">
+        <button id="searchButton" style="padding: 5px 10px;">Search & Highlight</button>
+    </div>
     <script>
         var adjacency = {json.dumps(adjacency)};
         var geoMap = {json.dumps(geo_map)};
@@ -114,6 +118,40 @@ def visualize_adjacency(network_file, adjacency_file):
                     var segId = data.points[0].customdata[0];
                     console.log("Clicked Segment ID:", segId);
                     highlightNeighbors(segId, plotEl);
+                }}
+            }});
+
+            document.getElementById('searchButton').addEventListener('click', function() {{
+                var segId = document.getElementById('segIdInput').value;
+                if (segId && geoMap[segId]) {{
+                    console.log("Searching for Segment ID:", segId);
+                    highlightNeighbors(segId, plotEl);
+                    
+                    // Also center the map on the found segment
+                    let centerCoords = null;
+                    for (const p of geoMap[segId]) {{
+                        if (p[0] !== null && p[1] !== null) {{
+                            centerCoords = p;
+                            break;
+                        }}
+                    }}
+                    if (centerCoords) {{
+                         Plotly.relayout(plotEl, {{
+                            'mapbox.center.lat': centerCoords[0],
+                            'mapbox.center.lon': centerCoords[1],
+                            'mapbox.zoom': 17
+                        }});
+                    }}
+                }} else {{
+                    alert("Segment ID '" + segId + "' not found in map data.");
+                }}
+            }});
+
+            // Allow pressing Enter in the input field to trigger search
+            document.getElementById('segIdInput').addEventListener('keyup', function(event) {{
+                if (event.key === "Enter") {{
+                    event.preventDefault();
+                    document.getElementById('searchButton').click();
                 }}
             }});
         }});
