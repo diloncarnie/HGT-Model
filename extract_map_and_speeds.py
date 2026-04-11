@@ -1,6 +1,7 @@
 import argparse
 import time
 import os
+import shutil
 import json
 import multiprocessing
 import numpy as np
@@ -15,26 +16,6 @@ from leuvenmapmatching.matcher.distance import DistanceMatcher
 from leuvenmapmatching.map.inmem import InMemMap
 from scipy.spatial import KDTree
 
-sampling_interval = 1000  # 1.0Hz interpolation
-test_percentage = 0.05  # Percentage of vehicles to take in test mode
-debug_segments = ["1750", "1909", "1751", "165", "1756", "1753", "2229", "12974", "335", "1895", "1834", "10863"]
-removed_vehicles = []
-removed_segments = ["1770","1797","1784","1800","14486","1835","1747","1904","1905","1917","1897","1757","1794",
-                    "2389","337","287","329","455","10955","10861","10854", "2390","12601","81","82","338","160","2248","14465","14389","10880","256","260","190","12976","286","82","159","161","160","159","214","286","250","249"]
-
-fixed_segments = {  "0":3,"3":3,
-                    "165":2,"177":3,"199":3,"243":2,"299":3,"291":3,"293":3,"296":3,"399":3,"210":2,"211":3,"226":3,"240":2,"285":2,"290":3,"298":4,"300":4,"325":3,"335":2,"389":3,
-                    "1801":5,"1802":3,"1803":3,
-                    "2228":3, "2229":3, "2250":4,
-                    "1748":3,"1750":4,"1751":3,"1753":3,"1756":3,"1759":3,"1760":5,"1764":3,"1766":4,"1768":4,"1769":5,"1771":3,"1772":3,"1793":4,"1798":3,"1799":3,
-                    "1804":3,"1828": 5,"1834": 4,"1836":4,"1837":5,"1839":5,"1848":4,"1849":3,"1851":3,"1855":3,"1895":3,"1896":3,"1899":3,
-                    "1902":3, "1903":3, "1906":4, "1908":2, "1909":4,
-                    "6579":4,
-                    "10869":3,"10863":3,"10855":3,"10858":3,"10862":3,"10865":3,"10872":4,"10874":3,"10882":3,"10956":5,
-                    "12974":4,"12975":3,
-                    "13064":4,"13232":4,"13803":5,"13869":3,"13871":3,
-                    "14317":3,"14346":3}
-
 def get_osm_map(edges_gdf):
     map_con = InMemMap("osm", use_latlon=False, use_rtree=True, index_edges=True)
     for _, row in edges_gdf.iterrows():
@@ -45,7 +26,7 @@ def get_osm_map(edges_gdf):
         map_con.add_edge(u, v)
     return map_con
 
-def parse_pneuma_to_long(filepath, test=False):
+def parse_pneuma_to_long(filepath, config, test=False):
     print(f"Parsing {filepath}...")
     start_time = time.time()
     
@@ -65,8 +46,8 @@ def parse_pneuma_to_long(filepath, test=False):
                 if len(parts) > 1 and parts[1].strip() != 'Motorcycle':
                     num_vehicles += 1
                     
-        limit = max(1, int(num_vehicles * test_percentage))
-        print(f"Test mode: taking {test_percentage*100:.1f}% of non-motorcycle vehicles ({limit} out of {num_vehicles})")
+        limit = max(1, int(num_vehicles * config["test_percentage"]))
+        print(f"Test mode: taking {config['test_percentage']*100:.1f}% of non-motorcycle vehicles ({limit} out of {num_vehicles})")
     else:
         limit = float('inf')
 
@@ -88,9 +69,6 @@ def parse_pneuma_to_long(filepath, test=False):
             track_id = parts[0].strip()
             v_type = parts[1].strip()
             
-            if track_id in removed_vehicles:
-                continue
-      
             
             if v_type == 'Motorcycle':
                 continue
@@ -102,9 +80,9 @@ def parse_pneuma_to_long(filepath, test=False):
             points = parts[4:]
             sampled_pts = []
             last_included_timestamp = None
-            variance = int(sampling_interval * 0.1)  # 10% variance
+            variance = int(config["sampling_interval"] * 0.1)  # 10% variance
             for i in range(0, len(points)-1, 6):
-                current_gap = sampling_interval + np.random.randint(-variance, variance + 1)
+                current_gap = config["sampling_interval"] + np.random.randint(-variance, variance + 1)
                 try:
                     lat, lon, speed_kmh, lon_acc, lat_acc, ts = points[i:i+6]
                     ts_float = float(ts.strip())
@@ -138,7 +116,7 @@ def parse_pneuma_to_long(filepath, test=False):
     print(f"Parsing took {time.time() - start_time:.2f} seconds. Parsed {len(df)} points.")
     return df
 
-def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_dist_start=5, max_dist_end=15, step=5):
+def process_map_matching_chunk(chunk_df, crs, gpkg_path, config):
     edges_gdf = gpd.read_file(gpkg_path)
     map_con = get_osm_map(edges_gdf)
     
@@ -164,11 +142,11 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_
         
         matcher = None
         matched_states = None
-        for max_dist in range(max_dist_start, max_dist_end + 1, step):
+        for max_dist in range(config["map_matching_max_dist_start"], config["map_matching_max_dist_end"] + 1, config["map_matching_step"]):
             # non_emitting_states=False ensures 1:1 mapping between observations and states
             matcher = DistanceMatcher(map_con, max_dist=max_dist, obs_noise=max_dist, non_emitting_states=False)
             states, last_idx = matcher.match(path)
-            if states and (last_idx == len(path) - 1 or max_dist == max_dist_end):
+            if states and (last_idx == len(path) - 1 or max_dist == config["map_matching_max_dist_end"]):
                 matched_states = states
                 break
                 
@@ -278,7 +256,7 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_
         group_results['t_proj'] = t_projs
         
         # Filter out points with relative heading > 45 degrees
-        group_results = group_results[group_results['rel_heading'] <= 45.0].copy()
+        group_results = group_results[group_results['rel_heading'] <= config["rel_heading_limit"]].copy()
         
         if group_results.empty:
             continue
@@ -286,9 +264,9 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_
         # Filter out partial traversals (traversed < 80% of the segment length)
         # Skip this filter for segments shorter than 25 meters to avoid pruning fast traversals
         def is_fully_traversed(group):
-            if group['segment_length'].iloc[0] < 30.0:
+            if group['segment_length'].iloc[0] < config["partial_traversal_length_thresh"]:
                 return True
-            return (group['prop_dist'].max() - group['prop_dist'].min()) >= 0.75
+            return (group['prop_dist'].max() - group['prop_dist'].min()) >= config["partial_traversal_prop_thresh"]
 
         valid_traversals = group_results.groupby('segment_id').filter(is_fully_traversed)
         group_results = valid_traversals.copy()
@@ -303,7 +281,7 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path='osm_network.gpkg', max_
         
     return pd.concat(matched_results, ignore_index=True)
 
-def perform_map_matching(df, crs, gpkg_path='osm_network.gpkg', max_dist_start=5, max_dist_end=25, step=5):
+def perform_map_matching(df, crs, gpkg_path, config):
     print("Performing iterative map matching and distance calculation with multiprocessing...")
     start_time = time.time()
     
@@ -320,7 +298,7 @@ def perform_map_matching(df, crs, gpkg_path='osm_network.gpkg', max_dist_start=5
     chunk_dfs = [df[df['track_id'].isin(chunk.tolist())] for chunk in chunks if len(chunk) > 0]
     
     pool = multiprocessing.Pool(processes=num_processes)
-    results = pool.starmap(process_map_matching_chunk, [(cdf, crs, gpkg_path, max_dist_start, max_dist_end, step) for cdf in chunk_dfs])
+    results = pool.starmap(process_map_matching_chunk, [(cdf, crs, gpkg_path, config) for cdf in chunk_dfs])
     pool.close()
     pool.join()
     
@@ -328,7 +306,7 @@ def perform_map_matching(df, crs, gpkg_path='osm_network.gpkg', max_dist_start=5
     print(f"Map matching and distance calculation took {time.time() - start_time:.2f} seconds. Matched {len(final_df)} points.")
     return final_df
 
-def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
+def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=False):
     if test:
         print("Performing Jenks Optimization...")
     start_time = time.time()
@@ -361,12 +339,12 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
 
         num_lanes_osm = int(group['num_lanes'].iloc[0])
 
-        if len(D_vals) > 50:
+        if len(D_vals) > config["jenks_min_points"]:
             # Iterative filtering for speed (5, 3, 1) while maintaining the current rel_heading filter
             hq_D_final = None
-            for s_thresh in [7.5, 5.0, 3.0, 1.0]:
-                mask = (group['speed'] > s_thresh) & (group['rel_heading'] < 5.0)
-                if mask.sum() >= 50:
+            for s_thresh in config["jenks_speed_thresholds"]:
+                mask = (group['speed'] > s_thresh) & (group['rel_heading'] < config["jenks_heading_threshold"])
+                if mask.sum() >= config["jenks_min_points"]:
                     hq_D_final = D_vals[mask.values]
                     if test:
                         print(f"Segment {seg_id}: Retained {len(hq_D_final)} points using speed > {s_thresh}")
@@ -382,8 +360,8 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
             hq_D_trimmed = hq_D_final # No longer trimming
 
             # Balanced Sampling: Take an equal-ish number of samples from across the distribution
-            counts, bins = np.histogram(hq_D_trimmed, bins=40)
-            target_per_bin = max(10, 15000 // (len(counts[counts > 0]) or 1))
+            counts, bins = np.histogram(hq_D_trimmed, bins=config["jenks_bins"])
+            target_per_bin = max(config["jenks_target_per_bin"], config["jenks_max_target_calc"] // (len(counts[counts > 0]) or 1))
 
             balanced_sample = []
             for i in range(len(counts)):
@@ -396,12 +374,12 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
 
             # Iterative Lane Partitioning: Start with max_distance / avg_lane_width
             max_distance = (road_max - road_min)  
-            avg_lane_width = 3.2
+            avg_lane_width = config["avg_lane_width"]
             initial_k = max(1, round(max_distance / avg_lane_width))
 
             best_breaks = None
-            if seg_id in fixed_segments:
-                k = fixed_segments[seg_id]
+            if seg_id in config["fixed_segments"]:
+                k = config["fixed_segments"][seg_id]
                 if k == 1:
                     best_breaks = [road_min, road_max]
                     if test:
@@ -424,7 +402,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                         valid = True
                         for i in range(1, len(breaks)):
                             width = breaks[i] - breaks[i-1]
-                            if width < 1.6 or width > 4.5:
+                            if width < config["min_lane_width_loose"] or width > config["max_lane_width"]:
                                 valid = False
                                 break
                         if valid:
@@ -451,7 +429,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                         valid = True
                         for i in range(1, len(breaks)):
                             width = breaks[i] - breaks[i-1]
-                            if width < 1.75 or width > 4.5:
+                            if width < config["min_lane_width_strict"] or width > config["max_lane_width"]:
                                 valid = False
                                 break
                         if valid:
@@ -473,7 +451,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                             valid = True
                             for i in range(1, len(breaks)):
                                 width = breaks[i] - breaks[i-1]
-                                if width < 1.75 or width > 4.5:
+                                if width < config["min_lane_width_strict"] or width > config["max_lane_width"]:
                                     valid = False
                                     break
                             if valid:
@@ -498,13 +476,13 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
                 except ValueError:
                     lane_boundaries[seg_id] = [road_min + i * avg_lane_width for i in range(initial_k + 1)]
         else:
-            if seg_id in fixed_segments:
-                num_lanes_fixed = fixed_segments[seg_id]
-                lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes_fixed + 1)]
+            if seg_id in config["fixed_segments"]:
+                num_lanes_fixed = config["fixed_segments"][seg_id]
+                lane_boundaries[seg_id] = [i * config["avg_lane_width"] for i in range(num_lanes_fixed + 1)]
                 if test:
                     print(f"Segment {seg_id}: Manual override applied. Assigned {num_lanes_fixed} lanes (low sample fallback).")
             else:
-                lane_boundaries[seg_id] = [i * 3.2 for i in range(num_lanes_osm + 1)]
+                lane_boundaries[seg_id] = [i * config["avg_lane_width"] for i in range(num_lanes_osm + 1)]
 
     # Lane Assignment and Outlier Removal
     df['lane_index'] = 0
@@ -554,7 +532,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
     os.makedirs(debug_dir, exist_ok=True)
     os.makedirs(failed_dir, exist_ok=True)
     
-    segments_to_plot = set(debug_segments).union(set(failed_segments))
+    segments_to_plot = set(config["debug_segments"]).union(set(failed_segments))
     print(f"Number of failed segments to plot: {len(failed_segments)}.")
     
     for seg in segments_to_plot:
@@ -581,7 +559,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=False):
         
     return df
 
-def calculate_empirical_speeds(df, edges_gdf, output_dir):
+def calculate_empirical_speeds(df, edges_gdf, output_dir, config):
     print("Calculating empirical speeds...")
     start_time = time.time()
     
@@ -592,7 +570,7 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir):
     
     # Impute missing
     # Default highway speeds in m/s
-    default_speeds = {'primary': 14.0, 'secondary': 11.0, 'tertiary': 9.0, 'trunk': 20.0, 'residential': 8.0, 'unclassified': 8.0}
+    default_speeds = config["default_speeds"]
     
     empirical_speeds = {}
     for _, row in edges_gdf.iterrows():
@@ -601,7 +579,7 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir):
         if seg_id in speeds:
             empirical_speeds[seg_id] = speeds[seg_id]
         else:
-            empirical_speeds[seg_id] = default_speeds.get(hw, 10.0)
+            empirical_speeds[seg_id] = default_speeds.get(hw, config["default_speed_fallback"])
             
     with open(os.path.join(output_dir, 'empirical_free_flow_speeds.json'), 'w') as f:
         json.dump(empirical_speeds, f, indent=4)
@@ -610,7 +588,7 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir):
     return empirical_speeds
 
 def process_frenet_for_timestamp(group_data_tuple):
-    timestamp, df_group, adjacency, speeds = group_data_tuple
+    timestamp, df_group, adjacency, speeds, config = group_data_tuple
     
     if df_group.empty:
         return pd.DataFrame()
@@ -633,7 +611,7 @@ def process_frenet_for_timestamp(group_data_tuple):
         ego_S = ego['t_proj'] # calculated explicitly in map matching
         ego_az = ego['azcar']
         
-        neighbors_idx = tree.query_ball_point(ego_pos, r=70) # 50m max long + 20m lat
+        neighbors_idx = tree.query_ball_point(ego_pos, r=config["kdtree_radius"])
         
         valid_neighbors = []
         ego_adj = adjacency.get(ego_seg, {})
@@ -650,7 +628,7 @@ def process_frenet_for_timestamp(group_data_tuple):
             # Heading Filter: Use dynamic vehicle azimuth (azcar) instead of static segment headings
             n_az = n_row['azcar']
             heading_diff = abs((n_az - ego_az + 180) % 360 - 180)
-            if heading_diff > 65.0:
+            if heading_diff > config["frenet_heading_diff_thresh"]:
                 continue
 
             # Topological Check
@@ -685,16 +663,16 @@ def process_frenet_for_timestamp(group_data_tuple):
         for n in valid_neighbors:
             dS = n['delta_S']
             dD = n['delta_D']
-            v_len = 5.0 if n['type'] in ['Car', 'Taxi'] else 12.5 # approx lengths
+            v_len = config["frenet_v_len_car"] if n['type'] in ['Car', 'Taxi'] else config["frenet_v_len_heavy"]
             
-            if -50 <= dS <= 50:
-                if -1.6 <= dD <= 1.6:
+            if -config["frenet_delta_s_thresh"] <= dS <= config["frenet_delta_s_thresh"]:
+                if -config["frenet_delta_d_thresh"] <= dD <= config["frenet_delta_d_thresh"]:
                     if dS > 0: zones['proceeding'].append((n['speed'], v_len))
                     elif dS < 0: zones['following'].append((n['speed'], v_len))
-                elif dD > 1.6:
+                elif dD > config["frenet_delta_d_thresh"]:
                     if dS >= 0: zones['leftwards_proceeding'].append((n['speed'], v_len))
                     else: zones['leftwards_following'].append((n['speed'], v_len))
-                elif dD < -1.6:
+                elif dD < -config["frenet_delta_d_thresh"]:
                     if dS >= 0: zones['rightwards_proceeding'].append((n['speed'], v_len))
                     else: zones['rightwards_following'].append((n['speed'], v_len))
                 
@@ -704,7 +682,7 @@ def process_frenet_for_timestamp(group_data_tuple):
         for z in zones.keys():
             if not zones[z]:
                 ego_res[f'raw_density_{z}'] = 0
-                ego_res[f'raw_speed_{z}'] = speeds.get(ego_seg, 10.0) 
+                ego_res[f'raw_speed_{z}'] = speeds.get(ego_seg, config["default_speed_fallback"]) 
                 ego_res[f'relative_occupancy_{z}'] = 0.0
                 ego_res[f'relative_speed_{z}'] = 1.0
             else:
@@ -712,39 +690,39 @@ def process_frenet_for_timestamp(group_data_tuple):
                 ego_res[f'raw_speed_{z}'] = np.mean([x[0] for x in zones[z]])
                 
                 # Occupancy = sum(length + 2) / Area
-                occ_sum = sum([x[1] + 2.0 for x in zones[z]])
+                occ_sum = sum([x[1] + config["frenet_occ_buffer"] for x in zones[z]])
                 if z in ['proceeding', 'following']:
-                    occ = min(1.0, occ_sum / 50.0)
+                    occ = min(1.0, occ_sum / config["frenet_delta_s_thresh"])
                 else:
                     # Side zones are 50m long (approx) and rem_lanes wide
-                    occ = min(1.0, occ_sum / (50.0 * rem_lanes))
+                    occ = min(1.0, occ_sum / (config["frenet_delta_s_thresh"] * rem_lanes))
                 ego_res[f'relative_occupancy_{z}'] = occ
                 
-                ego_res[f'relative_speed_{z}'] = ego_res[f'raw_speed_{z}'] / max(1.0, speeds.get(ego_seg, 10.0))
+                ego_res[f'relative_speed_{z}'] = ego_res[f'raw_speed_{z}'] / max(1.0, speeds.get(ego_seg, config["default_speed_fallback"]))
                 
         results.append(ego_res)
         
     return pd.DataFrame(results)
 
-def process_single_file(input_file, edges_gdf, args):
+def process_single_file(input_file, edges_gdf, network_path, args, config):
     print(f"\n--- Processing {input_file} ---")
     file_start_time = time.time()
     
-    df = parse_pneuma_to_long(input_file, test=args.test)
+    df = parse_pneuma_to_long(input_file, config, test=args.test)
     if df.empty:
         print("No data parsed.")
         return
         
-    df = perform_map_matching(df, edges_gdf.crs, 'osm_network.gpkg')
+    df = perform_map_matching(df, edges_gdf.crs, network_path, config)
     if df.empty:
         return
         
     # Filter segments with fewer than 10 unique vehicles or in removed_segments
-    print(f"Filtering segments (Min 10 vehicles, Exclude blacklist: {len(removed_segments)})...")
+    print(f"Filtering segments (Min {config['min_vehicles_per_segment']} vehicles, Exclude blacklist: {len(config['removed_segments'])})...")
     seg_counts = df[df['segment_id'] != ""].groupby('segment_id')['track_id'].nunique()
     
     # Identify segments that meet the volume threshold AND are not in the blacklist
-    valid_segments = [s for s in seg_counts.index if s not in removed_segments and seg_counts[s] >= 10]
+    valid_segments = [s for s in seg_counts.index if s not in config["removed_segments"] and seg_counts[s] >= config["min_vehicles_per_segment"]]
     
     initial_count = len(df)
     df = df[df['segment_id'].isin(valid_segments)].reset_index(drop=True)
@@ -753,7 +731,11 @@ def process_single_file(input_file, edges_gdf, args):
     print(f"Removed {initial_count - len(df)} points across {num_removed_segs} segments (low volume or blacklisted).")
 
     file_name = os.path.splitext(os.path.basename(input_file))[0]
-    output_dir = os.path.join("processed_data", file_name)
+    date_part = file_name.split('_')[0]
+    output_dir = os.path.join("processed_data", date_part, file_name)
+    
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
     # Export filtered road network
@@ -763,8 +745,8 @@ def process_single_file(input_file, edges_gdf, args):
     filtered_edges = edges_gdf[edges_gdf['segment_id'].astype(str).isin(valid_segments)]
     filtered_edges.to_file(filtered_network_path, driver='GPKG')
 
-    df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, test=args.test)
-    empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir)
+    df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=args.test)
+    empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir, config)
     
     # Export matched trajectories for visualization
     matched_trajectories_path = os.path.join(output_dir, "matched_trajectories.csv")
@@ -786,17 +768,17 @@ def process_single_file(input_file, edges_gdf, args):
     
     print("Loading topological adjacency...")
     try:
-        with open('topological_adjacency.json', 'r') as f:
+        with open('topological_adjacency_merged.json', 'r') as f:
             adjacency = json.load(f)
     except FileNotFoundError:
-        print("Error: topological_adjacency.json not found. Make sure to run the external OSM downloader script.")
+        print("Error: topological_adjacency_merged.json not found. Make sure to run the external OSM downloader script.")
         return
         
     # Sampling 15% of all unique Car/Taxi tracks as CAVs
     print("Sampling 15% of unique Car/Taxi tracks as CAVs...")
     df['is_CAV'] = False
     unique_tracks = df[df['type'].isin(['Car', 'Taxi'])]['track_id'].unique()
-    n_sample = max(1, int(len(unique_tracks) * 0.15))
+    n_sample = max(1, int(len(unique_tracks) * config["cav_sample_percentage"]))
     sampled_cavs = np.random.choice(unique_tracks, n_sample, replace=False)
     df.loc[df['track_id'].isin(sampled_cavs), 'is_CAV'] = True
     print(f"Total CAVs selected: {len(sampled_cavs)} out of {len(unique_tracks)} unique Car/Taxi vehicles.")
@@ -810,7 +792,7 @@ def process_single_file(input_file, edges_gdf, args):
     
     time_groups = []
     for ts, group in df.groupby('time_bucket'):
-        time_groups.append((ts, group.copy(), adjacency, empirical_speeds))
+        time_groups.append((ts, group.copy(), adjacency, empirical_speeds, config))
         
     pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
     results = pool.map(process_frenet_for_timestamp, time_groups)
@@ -828,7 +810,7 @@ def process_single_file(input_file, edges_gdf, args):
     print("Calculating final kinematics...")
     kin_start = time.time()
     
-    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(empirical_speeds).fillna(10.0)
+    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(empirical_speeds).fillna(config["default_speed_fallback"])
     final_df['relative_ego_speed'] = final_df['speed'] / final_df['segment_free_flow_speed']
     
     final_df = final_df.sort_values(['track_id', 'time'])
@@ -864,10 +846,50 @@ def process_single_file(input_file, edges_gdf, args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('input_path', help="Path to a single pNEUMA CSV file or directory")
-    parser.add_argument('--test', action='store_true', help="Test mode (only 15 vehicles)")
+    parser.add_argument('--test', action='store_true', help="Test/Debugging mode (Only processes a percentage vehicles)")
     args = parser.parse_args()
     
     overall_start = time.time()
+    
+    with open('removed_segments.json', 'r') as f:
+        removed_segments_list = json.load(f)
+    with open('fixed_segments.json', 'r') as f:
+        fixed_segments_dict = json.load(f)
+        
+    config = {
+        "sampling_interval": 1000,
+        "test_percentage": 0.03,
+        "debug_segments": ["1750", "1909", "1751", "165", "1756", "1753", "2229", "12974", "335", "1895", "1834", "10863", "2227", "1836"],
+        "removed_segments": removed_segments_list,
+        "fixed_segments": fixed_segments_dict,
+        "map_matching_max_dist_start": 5,
+        "map_matching_max_dist_end": 25,
+        "map_matching_step": 5,
+        "rel_heading_limit": 45.0,
+        "partial_traversal_length_thresh": 50.0,
+        "partial_traversal_prop_thresh": 0.6,
+        "min_vehicles_per_segment": 5,
+        "cav_sample_percentage": 0.15,
+        "kdtree_radius": 70,
+        "frenet_heading_diff_thresh": 65.0,
+        "frenet_delta_s_thresh": 50.0,
+        "frenet_delta_d_thresh": 1.6,
+        "frenet_v_len_car": 5.0,
+        "frenet_v_len_heavy": 12.5,
+        "frenet_occ_buffer": 2.0,
+        "jenks_min_points": 50,
+        "jenks_speed_thresholds": [7.5, 5.0, 3.0, 1.0],
+        "jenks_heading_threshold": 5.0,
+        "jenks_target_per_bin": 10,
+        "jenks_max_target_calc": 15000,
+        "jenks_bins": 40,
+        "avg_lane_width": 3.2,
+        "min_lane_width_loose": 1.6,
+        "min_lane_width_strict": 1.75,
+        "max_lane_width": 4.5,
+        "default_speeds": {'primary': 14.0, 'secondary': 11.0, 'tertiary': 9.0, 'trunk': 20.0, 'residential': 8.0, 'unclassified': 8.0},
+        "default_speed_fallback": 10.0
+    }
     
     if os.path.isdir(args.input_path):
         files = sorted([os.path.join(args.input_path, f) for f in os.listdir(args.input_path) if f.endswith('.csv')])
@@ -879,10 +901,11 @@ def main():
         return
         
     print("Loading OSM network...")
-    edges_gdf = gpd.read_file('osm_network.gpkg')
+    network_path = 'osm_network_merged.gpkg'
+    edges_gdf = gpd.read_file(network_path)
     
     for input_file in files:
-        process_single_file(input_file, edges_gdf, args)
+        process_single_file(input_file, edges_gdf, network_path, args, config)
 
     print(f"\nTotal pipeline execution completed in {time.time() - overall_start:.2f} seconds.")
 
