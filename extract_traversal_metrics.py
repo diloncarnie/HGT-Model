@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import warnings
 import math
+from functools import partial
 
 # Suppress warnings if needed
 warnings.filterwarnings('ignore')
@@ -37,7 +38,7 @@ def calculate_rtsm(temporal_speed, spatial_speed, temp_thresh, spat_thresh):
     rtsm = distance / worst_case_distance
     return float(max(0.0, min(1.0, rtsm)))
 
-def process_track(track_data):
+def process_track(track_data, config):
     """Processes all segments for a single track_id."""
     track_id, track_df = track_data
     track_df = track_df.sort_values('time').reset_index(drop=True)
@@ -61,9 +62,9 @@ def process_track(track_data):
         
         segment_length = group_df['segment_length'].iloc[0]
         
-        # Gap filtering check (>2.0 seconds) to filter out single traversals
+        # Gap filtering check to filter out single traversals
         time_diffs = group_df['time'].diff()
-        if (time_diffs > 60.0).any():
+        if (time_diffs > config['gap_threshold']).any():
             segment_stats[segment_id]['invalid'] += 1
             continue
             
@@ -89,7 +90,7 @@ def process_track(track_data):
                 records.append(prev_row)
                 has_prev = True
         else:
-            if valid_group['t_proj'].iloc[0] <= min(25.0, 0.2 * segment_length):
+            if valid_group['t_proj'].iloc[0] <= max(config['min_edge_threshold'], min(config['max_edge_threshold'], config['edge_prop_threshold'] * segment_length)):
                 has_prev = True
             
                 
@@ -104,14 +105,17 @@ def process_track(track_data):
                 records.append(next_row)
                 has_following = True
         else:
-            if segment_length - valid_group['t_proj'].iloc[-1] <= min(25.0, 0.2 * segment_length):
+            if segment_length - valid_group['t_proj'].iloc[-1] <= max(config['min_edge_threshold'], min(config['max_edge_threshold'], config['edge_prop_threshold'] * segment_length)):
                 has_following = True
                 
         # Quit if incomplete traversal (missing prev/next and not within threshold) or not enough records to interpolate
         if not has_prev or not has_following or len(records) < 2:
-            # print(f"Track {track_id}, segment {segment_id} has incomplete traversal (has_prev={has_prev}, has_following={has_following}, record_count={len(records)}). Skipping.")
+            if len(records) < 2:
+                print(f"Track {track_id}, segment {segment_id} has insufficient records for interpolation (record_count={len(records)}). Skipping.")
             segment_stats[segment_id]['invalid'] += 1
             continue
+        
+        
             
         traversal_df = pd.DataFrame(records)
         
@@ -132,10 +136,6 @@ def process_track(track_data):
             
             # Calculate traversal length
             length = segment_length
-            last_knot = t_proj[-1]
-            CONNECTION_LENGTH_THRESHOLD = 5.0
-            if length > last_knot and (length - CONNECTION_LENGTH_THRESHOLD) <= last_knot:
-                length = last_knot
                 
             traversal_time = float(f_time(length) - f_time(0.0))
             if traversal_time <= 0:
@@ -149,14 +149,14 @@ def process_track(track_data):
             cur = math.ceil(first_offset)
             end = math.floor(last_offset)
             
-            if end - cur < 10.0:
+            if end - cur < config['speed_sample_interval']:
                 spatial_mean_speed = valid_group['speed'].mean()
             else:
                 eval_points = []
                 temp_cur = float(cur)
-                while end - temp_cur >= 10.0:
+                while end - temp_cur >= config['speed_sample_interval']:
                     eval_points.append(temp_cur)
-                    temp_cur += 10.0
+                    temp_cur += config['speed_sample_interval']
                 spatial_mean_speed = np.mean(f_speed(np.array(eval_points)))
                 
         except Exception as e:
@@ -171,12 +171,12 @@ def process_track(track_data):
             spatial_mean_speed = valid_group['speed'].mean()
             traversal_time = total_t
 
-        # Calculate stopping duration (where speed < 0.1m/s)
+        # Calculate stopping duration
         vg_times = valid_group['time'].values
         vg_speeds = valid_group['speed'].values
         stopping_duration = 0.0
         for i in range(1, len(valid_group)):
-            if vg_speeds[i] < 0.1 and vg_speeds[i-1] < 0.1:
+            if vg_speeds[i] < config['stopped_speed_threshold'] and vg_speeds[i-1] < config['stopped_speed_threshold']:
                 stopping_duration += vg_times[i] - vg_times[i-1]
 
         traversals.append({
@@ -192,7 +192,7 @@ def process_track(track_data):
         
     return traversals, segment_stats
 
-def process_file(csv_path):
+def process_file(csv_path, config):
     t0 = time.time()
     print(f"Processing: {csv_path}")
     try:
@@ -212,8 +212,9 @@ def process_file(csv_path):
     valid_traversals = []
     global_segment_stats = {}
     
+    process_func = partial(process_track, config=config)
     with mp.Pool() as pool:
-        results = pool.map(process_track, grouped)
+        results = pool.map(process_func, grouped)
         
     for res_traversals, res_stats in results:
         valid_traversals.extend(res_traversals)
@@ -246,12 +247,10 @@ def process_file(csv_path):
         red_light_duration = 0.0
         # Calculate threshold if there is more than one traversal
         if len(times) > 1:
-            filtered_times = [t for t in times if t > 2.0]
+            filtered_times = [t for t in times if t > config['min_traversal_time']]
             if len(filtered_times) > 0:
                 p5_time = np.percentile(times, 5)
-                
                 red_light_duration = np.percentile(seg_df['stopping_duration'], 95)
-                        
                 ideal_time = p5_time + red_light_duration
                 if ideal_time > 0:
                     temp_thresh = seg_length / ideal_time
@@ -264,10 +263,12 @@ def process_file(csv_path):
                     
         # Spatial Threshold
         spat_thresh = None
+        free_flow_speed = -1.0
         if len(seg_df) > 1 and temp_thresh is not None:
             good_temp_df = seg_df[seg_df['temporal_mean_speed'] >= temp_thresh]
             if len(good_temp_df) > 0:
                 spat_thresh = np.percentile(good_temp_df['spatial_mean_speed'], 5)
+                free_flow_speed = np.percentile(good_temp_df['spatial_mean_speed'], 85)
             else:
                 print(f"Segment {segment_id} has no traversals meeting temporal threshold for spatial threshold calculation (count={len(good_temp_df)}, temp_thresh={temp_thresh}, length={seg_length})")
         else:
@@ -281,6 +282,7 @@ def process_file(csv_path):
         segment_thresholds[int(segment_id)] = {
             'temporal_threshold': temp_thresh,
             'spatial_threshold': spat_thresh,
+            'free_flow_speed': free_flow_speed,
             'red_light_duration': red_light_duration,
             'total_traversals': global_segment_stats[segment_id]['total'],
             'invalid_traversals': global_segment_stats[segment_id]['invalid']
@@ -295,6 +297,7 @@ def process_file(csv_path):
             segment_thresholds[sid_int] = {
                 'temporal_threshold': -1.0,
                 'spatial_threshold': -1.0,
+                'free_flow_speed': -1.0,
                 'red_light_duration': 0.0,
                 'total_traversals': stats['total'],
                 'invalid_traversals': stats['invalid']
@@ -328,15 +331,26 @@ def process_file(csv_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract vehicle traversal metrics from matched trajectories.")
     parser.add_argument("--file", type=str, help="Path to a single matched_trajectories.csv file")
-    parser.add_argument("--root-dir", type=str, help="Root directory to search recursively for matched_trajectories.csv")
+    parser.add_argument("--folder", type=str, help="Root directory to search recursively for matched_trajectories.csv")
     
     args = parser.parse_args()
     
+    config = {
+        "gap_threshold": 30.0,
+        "min_edge_threshold": 8.0,
+        "max_edge_threshold": 25.0,
+        "edge_prop_threshold": 0.3,
+        "connection_length_threshold": 5.0,
+        "speed_sample_interval": 10.0,
+        "stopped_speed_threshold": 0.1,
+        "min_traversal_time": 2.0
+    }
+    
     if args.file:
-        process_file(args.file)
-    elif args.root_dir:
-        root_path = Path(args.root_dir)
-        for csv_path in root_path.rglob("matched_trajectories.csv"):
-            process_file(csv_path)
+        process_file(args.file, config)
+    elif args.folder:
+        root_path = Path(args.folder)
+        for csv_path in root_path.rglob("matched_trajectories_filtered.csv"):
+            process_file(csv_path, config)
     else:
-        print("Please provide either --file or --root-dir")
+        print("Please provide either --file or --folder")
