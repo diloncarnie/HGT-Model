@@ -9,6 +9,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Unify OSM network files from multiple cities into a single file")
     parser.add_argument('--folder', default="processed_data", help="Path to processing folder")
+    parser.add_argument('--filter_csvs', action='store_true', help="Filter removed segments from _processed.csv and matched_trajectories.csv files")
     args = parser.parse_args()
     
     base_dir = args.folder
@@ -134,6 +135,28 @@ def main():
                 filtered_gdf.to_file(filtered_file_path, driver="GPKG")
             else:
                 filtered_gdfs.append(current_gdf)
+                
+            if args.filter_csvs:
+                dir_path = os.path.dirname(file_path)
+                folder_name = os.path.basename(dir_path)
+                
+                traj_file = os.path.join(dir_path, "matched_trajectories.csv")
+                if os.path.exists(traj_file):
+                    print(f"Filtering {traj_file}...")
+                    traj_df = pd.read_csv(traj_file)
+                    if 'segment_id' in traj_df.columns:
+                        filtered_traj = traj_df[~traj_df['segment_id'].astype(str).isin(removed_set)]
+                        traj_out = os.path.join(dir_path, "matched_trajectories_filtered.csv")
+                        filtered_traj.to_csv(traj_out, index=False)
+                        
+                proc_file = os.path.join(dir_path, f"{folder_name}_processed.csv")
+                if os.path.exists(proc_file):
+                    print(f"Filtering {proc_file}...")
+                    proc_df = pd.read_csv(proc_file)
+                    if 'segment_id' in proc_df.columns:
+                        filtered_proc = proc_df[~proc_df['segment_id'].astype(str).isin(removed_set)]
+                        proc_out = os.path.join(dir_path, f"{folder_name}_processed_filtered.csv")
+                        filtered_proc.to_csv(proc_out, index=False)
                 
         # Update unified_gdf and common_gdf
         print("\nRe-evaluating unified and common networks...")

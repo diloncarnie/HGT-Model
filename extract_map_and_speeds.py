@@ -563,7 +563,7 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir, config):
     print("Calculating empirical speeds...")
     start_time = time.time()
     
-    speed_df = df[df['type'].isin(['Car', 'Medium Vehicle'])]
+    speed_df = df
     
     # Calculate traversal speeds (simply 95th percentile of observed speeds per segment)
     speeds = speed_df.groupby('segment_id')['speed'].quantile(0.95).to_dict()
@@ -858,7 +858,7 @@ def main():
         
     config = {
         "sampling_interval": 1000,
-        "test_percentage": 0.03,
+        "test_percentage": 0.05,
         "debug_segments": ["1750", "1909", "1751", "165", "1756", "1753", "2229", "12974", "335", "1895", "1834", "10863", "2227", "1836"],
         "removed_segments": removed_segments_list,
         "fixed_segments": fixed_segments_dict,
