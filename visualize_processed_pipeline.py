@@ -50,7 +50,10 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
                 df_p['track_id'] = df_p['track_id'].astype(str) + f"_{folder_name}"
                 
                 # Load matched trajectories
-                match_file = os.path.join(subdir, 'matched_trajectories.csv')
+                match_file = os.path.join(subdir, 'matched_trajectories_filtered.csv')
+                if not os.path.exists(match_file):
+                    match_file = os.path.join(subdir, 'matched_trajectories.csv')
+        
                 if os.path.exists(match_file):
                     print(f"  Loading {match_file}...")
                     df_m = pd.read_csv(match_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier'])
@@ -377,30 +380,21 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize processed pipeline CAV features.")
-    parser.add_argument('--network', default='osm_network_merged.gpkg', help="Path to osm_network.gpkg")
-    parser.add_argument('--time_window', type=float, default=5.0, help="Size of the timeline bucket in seconds (default: 5.0)")
-    parser.add_argument('--input', nargs='?', help="Path to the _processed.csv file")       
+    parser.add_argument('--folder', required=True, help="Path to the folder containing osm_network.gpkg and processed CSV file")
+    parser.add_argument('--time_window', type=float, default=1.0, help="Size of the timeline bucket in seconds (default: 5.0)")
     parser.add_argument('--all', action='store_true', help="Visualize all points (no sampling)")
     args = parser.parse_args()
 
-    if args.input:
-        if not os.path.dirname(args.input):
-            args.input = os.path.join('processed_data', args.input)
-    else:
-        search_dir = 'processed_data'
-        if os.path.exists(search_dir):
-            processed_files = [f for f in os.listdir(search_dir) if f.endswith('_processed.csv')]
-            if processed_files:
-                args.input = os.path.join(search_dir, processed_files[0])      
-                print(f"No input specified, using: {args.input}")
-            else:
-                print(f"Error: No _processed.csv file found in '{search_dir}'. Please provide one with --input.")
-                return
-        else:
-            print(f"Error: '{search_dir}' directory not found. Please provide a file with --input.")
-            return
-
-    visualize_processed_pipeline(args.network, args.input, args.all, args.time_window)
+    folder_name = os.path.basename(os.path.normpath(args.folder))
+    network_path = os.path.join(args.folder, 'osm_network_filtered.gpkg')
+    input_path = os.path.join(args.folder, f"{folder_name}_processed_filtered.csv")
+    
+    if not os.path.exists(network_path):
+        network_path = os.path.join(args.folder, 'osm_network.gpkg')
+    if not os.path.exists(input_path):
+        input_path = os.path.join(args.folder, f"{folder_name}_processed.csv")
+    
+    visualize_processed_pipeline(network_path, input_path, args.all, args.time_window)
 
 if __name__ == '__main__':
     main()
