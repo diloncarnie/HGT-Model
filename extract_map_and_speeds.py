@@ -121,18 +121,40 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path, config):
     map_con = get_osm_map(edges_gdf)
     
     # Pre-map edge attributes for fast lookup
-    edge_map = {}
+    edge_data = {}
     lanes_map = {}
     len_map = {}
     uv_to_seg = {}
     hw_map = {}
     for _, row in edges_gdf.iterrows():
         key = (int(row['u']), int(row['v']))
-        edge_map[key] = row['geometry']
         lanes_map[key] = int(row['lanes'])
         len_map[key] = float(row['length'])
         uv_to_seg[key] = str(row['segment_id'])
         hw_map[key] = str(row['highway'])
+        
+        coords = np.array(row['geometry'].coords)
+        if len(coords) < 2:
+            continue
+            
+        a = coords[:-1]
+        b = coords[1:]
+        ab = b - a
+        sub_l2 = np.sum(ab * ab, axis=1)
+        sub_l = np.sqrt(sub_l2)
+        accum_l = np.insert(np.cumsum(sub_l), 0, 0)[:-1]
+        valid = sub_l2 > 0
+        az_sub = np.arctan2(ab[:, 0], ab[:, 1]) * 180 / np.pi
+        
+        edge_data[key] = {
+            'a': a,
+            'ab': ab,
+            'sub_l2': sub_l2,
+            'sub_l': sub_l,
+            'accum_l': accum_l,
+            'valid': valid,
+            'az_sub': az_sub
+        }
     
     matched_results = []
     grouped = chunk_df.groupby('track_id')
@@ -174,77 +196,77 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path, config):
         group_results['azcar'] = np.arctan2(dx, dy) * 180 / np.pi
         
         # Calculate signed distance and segment info immediately
-        signed_distances = []
-        segment_ids = []
-        num_lanes_list = []
-        segment_lengths = []
-        prop_distances = []
-        rel_headings = []
-        highways_list = []
-        t_projs = []
+        num_pts = len(group_results)
+        signed_distances = np.zeros(num_pts)
+        segment_ids = np.empty(num_pts, dtype=object)
+        num_lanes_list = np.zeros(num_pts, dtype=int)
+        segment_lengths = np.zeros(num_pts)
+        prop_distances = np.full(num_pts, 0.5)
+        rel_headings = np.zeros(num_pts)
+        highways_list = np.empty(num_pts, dtype=object)
+        t_projs = np.zeros(num_pts)
         
-        for idx, row in group_results.iterrows():
-            u, v = row['matched_u'], row['matched_v']
+        x_vals = group_results['x'].values
+        y_vals = group_results['y'].values
+        u_vals = group_results['matched_u'].values
+        v_vals = group_results['matched_v'].values
+        azcar_vals = group_results['azcar'].values
+        
+        for idx in range(num_pts):
+            u, v = u_vals[idx], v_vals[idx]
             key = (u, v)
-            if key not in edge_map:
-                signed_distances.append(0.0)
-                segment_ids.append("")
-                num_lanes_list.append(0)
-                segment_lengths.append(0.0)
-                prop_distances.append(0.5)
-                rel_headings.append(0.0)
-                highways_list.append("")
-                t_projs.append(0.0)
+            if key not in edge_data:
+                signed_distances[idx] = 0.0
+                segment_ids[idx] = ""
+                num_lanes_list[idx] = 0
+                segment_lengths[idx] = 0.0
+                prop_distances[idx] = 0.5
+                rel_headings[idx] = 0.0
+                highways_list[idx] = ""
+                t_projs[idx] = 0.0
                 continue
                 
-            geom = edge_map[key]
-            coords = list(geom.coords)
-            px, py = row['x'], row['y']
+            ed = edge_data[key]
+            a = ed['a']
+            ab = ed['ab']
+            sub_l2 = ed['sub_l2']
+            sub_l = ed['sub_l']
+            accum_l = ed['accum_l']
+            valid = ed['valid']
+            az_sub = ed['az_sub']
             
-            best_dist = float('inf')
-            signed_d = 0.0
-            dist_along = 0.0
-            best_az_sub = 0.0
+            p = np.array([x_vals[idx], y_vals[idx]])
+            ap = p - a
             
-            current_accumulated_l = 0.0
-            for i in range(len(coords)-1):
-                ax, ay = coords[i]
-                bx, by = coords[i+1]
-                a = np.array([ax, ay])
-                b = np.array([bx, by])
-                p = np.array([px, py])
-                
-                ab = b - a
-                ap = p - a
-                sub_l2 = np.dot(ab, ab)
-                if sub_l2 == 0: continue
-                
-                t = max(0, min(1, np.dot(ap, ab) / sub_l2))
-                proj = a + t * ab
-                dist = np.linalg.norm(p - proj)
-                
-                if dist < best_dist:
-                    best_dist = dist
-                    cross = ab[0]*ap[1] - ab[1]*ap[0]
-                    signed_d = dist * (-1 if cross > 0 else 1)
-                    dist_along = current_accumulated_l + t * np.sqrt(sub_l2)
-                    # Local azimuth of this specific sub-segment
-                    best_az_sub = np.arctan2(ab[0], ab[1]) * 180 / np.pi
-                
-                current_accumulated_l += np.sqrt(sub_l2)
+            dot_ap_ab = ap[:, 0] * ab[:, 0] + ap[:, 1] * ab[:, 1]
+            t = np.zeros_like(sub_l2)
+            t[valid] = np.clip(dot_ap_ab[valid] / sub_l2[valid], 0, 1)
             
-            total_l = len_map.get(key, current_accumulated_l or 1.0)
-            signed_distances.append(signed_d)
-            segment_ids.append(uv_to_seg.get(key, str(key)))
-            num_lanes_list.append(lanes_map.get(key, 2))
-            segment_lengths.append(total_l)
-            prop_distances.append(dist_along / total_l)
-            highways_list.append(hw_map.get(key, "unknown"))
-            t_projs.append(dist_along)
+            proj = a + t[:, np.newaxis] * ab
+            diff = p - proj
+            dists = np.sqrt(diff[:, 0]**2 + diff[:, 1]**2)
             
-            # Relative heading: difference between vehicle azimuth and sub-segment azimuth
-            rel_h = np.abs((row['azcar'] - best_az_sub + 180) % 360 - 180)
-            rel_headings.append(rel_h)
+            best_idx = np.argmin(dists)
+            best_dist = dists[best_idx]
+            
+            cross = ab[best_idx, 0] * ap[best_idx, 1] - ab[best_idx, 1] * ap[best_idx, 0]
+            signed_d = best_dist * (-1 if cross > 0 else 1)
+            dist_along = accum_l[best_idx] + t[best_idx] * sub_l[best_idx]
+            
+            total_l = len_map.get(key, accum_l[-1] + sub_l[-1])
+            if total_l <= 0.0:
+                total_l = 1.0
+            
+            signed_distances[idx] = signed_d
+            segment_ids[idx] = uv_to_seg.get(key, str(key))
+            num_lanes_list[idx] = lanes_map.get(key, 2)
+            segment_lengths[idx] = total_l
+            prop_distances[idx] = dist_along / total_l
+            highways_list[idx] = hw_map.get(key, "unknown")
+            t_projs[idx] = dist_along
+            
+            rel_h = np.abs((azcar_vals[idx] - az_sub[best_idx] + 180) % 360 - 180)
+            rel_headings[idx] = rel_h
             
         group_results['signed_dist'] = signed_distances
         group_results['segment_id'] = segment_ids
@@ -261,8 +283,8 @@ def process_map_matching_chunk(chunk_df, crs, gpkg_path, config):
         if group_results.empty:
             continue
             
-        # Filter out partial traversals (traversed < 80% of the segment length)
-        # Skip this filter for segments shorter than 25 meters to avoid pruning fast traversals
+        # Filter out partial traversals (traversed < 60% of the segment length)
+        # Skip this filter for segments shorter than 50 meters to avoid pruning fast traversals
         def is_fully_traversed(group):
             if group['segment_length'].iloc[0] < config["partial_traversal_length_thresh"]:
                 return True
@@ -486,7 +508,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
 
     # Lane Assignment and Outlier Removal
     df['lane_index'] = 0
-    outlier_mask = pd.Series(False, index=df.index)
+    df['is_outlier'] = False
     
     lanes_updated_count = 0
     for seg_id, bounds in lane_boundaries.items():
@@ -497,7 +519,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
         
         # Identify outliers (indices 0 for < bounds[0] or len(bounds) for >= bounds[-1])
         seg_outliers = (raw_indices == 0) | (raw_indices == len(bounds))
-        outlier_mask.loc[df[mask].index[seg_outliers]] = True
+        df.loc[df[mask].index[seg_outliers], 'is_outlier'] = True
         
         # Map valid points to 0-based lane indices (clipping here just avoids OutOfBounds errors before removal)
         df.loc[mask, 'lane_index'] = np.clip(raw_indices, 1, len(bounds) - 1) - 1
@@ -515,10 +537,8 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
     else:
         print("No segments had their 'num_lanes' altered from the OSM default (likely due to low sample size or Jenks agreeing with OSM).")
 
-    initial_len = len(df)
-    df = df[~outlier_mask].reset_index(drop=True)
-    removed_outliers = initial_len - len(df)
-    print(f"Removed {removed_outliers} outlier trajectory points that did not fit into edge lanes.")
+    flagged_outliers = df['is_outlier'].sum()
+    print(f"Flagged {flagged_outliers} outlier trajectory points that did not fit into edge lanes.")
 
     print(f"Jenks Optimization took {time.time() - start_time:.2f} seconds.")
 
@@ -831,7 +851,7 @@ def process_single_file(input_file, edges_gdf, network_path, args, config):
         'track_id', 'type', 'traveled_distance', 'avg_speed', 'lat', 'lon', 'speed', 'long_acc', 'lat_acc', 'time',
         'segment_id', 'segment_length', 'segment_type', 'num_lanes', 'lane_index', 'proportionate_distance_travelled',
         'change_in_euclidean_distance', 'relative_time_gap', 'relative_kinematic_ratio',
-        'segment_free_flow_speed', 'relative_ego_speed'
+        'segment_free_flow_speed', 'relative_ego_speed', 'is_outlier'
     ]
     
     for z in ['proceeding', 'following', 'leftwards_proceeding', 'leftwards_following', 'rightwards_proceeding', 'rightwards_following']:
@@ -859,13 +879,13 @@ def main():
     config = {
         "sampling_interval": 1000,
         "test_percentage": 0.05,
-        "debug_segments": ["1750", "1909", "1751", "165", "1756", "1753", "2229", "12974", "335", "1895", "1834", "10863", "2227", "1836"],
+        "debug_segments": ["1750", "1909", "1751", "1756", "1753", "1834", "2227", "1836","208","220"],
         "removed_segments": removed_segments_list,
         "fixed_segments": fixed_segments_dict,
         "map_matching_max_dist_start": 5,
-        "map_matching_max_dist_end": 25,
+        "map_matching_max_dist_end": 30,
         "map_matching_step": 5,
-        "rel_heading_limit": 45.0,
+        "rel_heading_limit": 90.0,
         "partial_traversal_length_thresh": 50.0,
         "partial_traversal_prop_thresh": 0.6,
         "min_vehicles_per_segment": 5,

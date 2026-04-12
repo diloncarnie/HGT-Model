@@ -199,7 +199,7 @@ def process_file(csv_path, config):
         df = pd.read_csv(csv_path)
     except Exception as e:
         print(f"Error reading {csv_path}: {e}")
-        return
+        return 0.0
 
     print(f"Loaded {len(df)} rows. Time: {time.time() - t0:.2f}s")
     t1 = time.time()
@@ -229,13 +229,15 @@ def process_file(csv_path, config):
     
     if not valid_traversals:
         print("No valid traversals found.")
-        return
+        return 0.0
 
     traversals_df = pd.DataFrame(valid_traversals)
     
     t3 = time.time()
     # Dynamic Segment Thresholds matching Java EXACTLY
     segment_thresholds = {}
+    file_max_red_light_duration = 0.0
+    file_max_red_light_segment_id = None
     
     for segment_id, seg_df in traversals_df.groupby('segment_id'):
         seg_length = seg_df['segment_length'].iloc[0]
@@ -251,6 +253,9 @@ def process_file(csv_path, config):
             if len(filtered_times) > 0:
                 p5_time = np.percentile(times, 5)
                 red_light_duration = np.percentile(seg_df['stopping_duration'], 95)
+                if red_light_duration > file_max_red_light_duration:
+                    file_max_red_light_duration = red_light_duration
+                    file_max_red_light_segment_id = segment_id
                 ideal_time = p5_time + red_light_duration
                 if ideal_time > 0:
                     temp_thresh = seg_length / ideal_time
@@ -327,6 +332,11 @@ def process_file(csv_path, config):
     traversals_df.sort_values('segment_id')[out_cols].to_csv(out_dir / 'traversal_metrics.csv', index=False)
         
     print(f"Total time for {csv_path}: {time.time() - t0:.2f}s\n")
+    
+    if file_max_red_light_duration > 0:
+        print(f"Max red light duration for this file: {file_max_red_light_duration:.2f}s (Segment ID: {file_max_red_light_segment_id})\n")
+        
+    return file_max_red_light_duration
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract vehicle traversal metrics from matched trajectories.")
@@ -346,11 +356,21 @@ if __name__ == "__main__":
         "min_traversal_time": 2.0
     }
     
+    max_red_light_durations = []
+
     if args.file:
-        process_file(args.file, config)
+        res = process_file(args.file, config)
+        if res > 0:
+            max_red_light_durations.append(res)
     elif args.folder:
         root_path = Path(args.folder)
         for csv_path in root_path.rglob("matched_trajectories_filtered.csv"):
-            process_file(csv_path, config)
+            res = process_file(csv_path, config)
+            if res > 0:
+                max_red_light_durations.append(res)
     else:
         print("Please provide either --file or --folder")
+        
+    if len(max_red_light_durations) > 1:
+        avg_max_red_light = sum(max_red_light_durations) / len(max_red_light_durations)
+        print(f"Average of max red light durations across {len(max_red_light_durations)} files: {avg_max_red_light:.2f}s")

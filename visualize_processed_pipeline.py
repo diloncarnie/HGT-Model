@@ -53,7 +53,7 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
                 match_file = os.path.join(subdir, 'matched_trajectories.csv')
                 if os.path.exists(match_file):
                     print(f"  Loading {match_file}...")
-                    df_m = pd.read_csv(match_file, usecols=['track_id', 'time', 'lat', 'lon'])
+                    df_m = pd.read_csv(match_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier'])
                     # Filter out processed vehicles for this specific folder
                     df_m = df_m[~df_m['track_id'].isin(all_processed)]
                     df_m['track_id'] = df_m['track_id'].astype(str) + f"_{folder_name}"
@@ -96,15 +96,22 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
             df_matched = pd.DataFrame()
         else:
             print(f"Loading matched trajectories from {matched_file}...")
-            df_matched = pd.read_csv(matched_file, usecols=['track_id', 'time', 'lat', 'lon'])
+            df_matched = pd.read_csv(matched_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier'])
             # Filter out processed vehicles
             df_matched = df_matched[~df_matched['track_id'].isin(all_processed)]
             df_matched['track_id'] = df_matched['track_id'].astype(str)
 
+    if 'is_outlier' not in df.columns:
+        df['is_outlier'] = False
+
     # ----------------------------------------------------
     # Downsample matched trajectories for grey points
     # ----------------------------------------------------
+    df_matched_outliers = pd.DataFrame()
     if not df_matched.empty:
+        if 'is_outlier' not in df_matched.columns:
+            df_matched['is_outlier'] = False
+            
         df_matched['time_window_sec'] = (df_matched['time'] // time_window) * time_window
         
         if not show_all:
@@ -117,8 +124,15 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
             print("Visualizing 100% of background trajectories.")
 
         print("Downsampling matched trajectories (grey points)...")
+        df_matched_outliers = df_matched[df_matched['is_outlier']].copy()
+        df_matched = df_matched[~df_matched['is_outlier']].copy()
+        
         df_matched = df_matched.groupby(['time_window_sec', 'track_id']).first().reset_index()
         df_matched['time_window_str'] = df_matched['time_window_sec'].astype(int).astype(str) + "s"
+        
+        if not df_matched_outliers.empty:
+            df_matched_outliers = df_matched_outliers.groupby(['time_window_sec', 'track_id']).first().reset_index()
+            df_matched_outliers['time_window_str'] = df_matched_outliers['time_window_sec'].astype(int).astype(str) + "s"
 
     # ----------------------------------------------------
     # Process CAV Data
@@ -140,6 +154,9 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
     # Group timestamps into buckets for the animation frame
     df['time_window_sec'] = (df['time'] // time_window) * time_window
 
+    df_outliers = df[df['is_outlier']].copy()
+    df = df[~df['is_outlier']].copy()
+
     # PERFORMANCE FIX: Downsample to 1 point per vehicle per time window.      
     print(f"Optimizing payload: Downsampling to 1 point per vehicle per frame...")
     df = df.groupby(['time_window_sec', 'track_id']).first().reset_index()     
@@ -147,11 +164,28 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
     df = df.sort_values(['time_window_sec', 'time'])
     df['time_window_str'] = df['time_window_sec'].astype(int).astype(str) + "s"
 
+    if not df_outliers.empty:
+        df_outliers = df_outliers.groupby(['time_window_sec', 'track_id']).first().reset_index()
+        df_outliers = df_outliers.sort_values(['time_window_sec', 'time'])
+        df_outliers['time_window_str'] = df_outliers['time_window_sec'].astype(int).astype(str) + "s"
+
+    all_outliers = pd.concat([df_outliers, df_matched_outliers], ignore_index=True) if not df_outliers.empty or not df_matched_outliers.empty else pd.DataFrame()
+    outlier_frames = {}
+    if not all_outliers.empty:
+        for t_str, group in all_outliers.groupby('time_window_str'):
+            outlier_frames[str(t_str)] = group
+
     # ----------------------------------------------------
     # Synchronize Timeline (Union of all buckets)
     # ----------------------------------------------------
     # Ensure the timeline slider covers all time steps from both datasets
-    all_buckets = sorted(list(set(df['time_window_sec'].unique()) | (set(df_matched['time_window_sec'].unique()) if not df_matched.empty else set())))
+    all_buckets_set = set(df['time_window_sec'].unique())
+    if not df_matched.empty:
+        all_buckets_set |= set(df_matched['time_window_sec'].unique())
+    if not all_outliers.empty:
+        all_buckets_set |= set(all_outliers['time_window_sec'].unique())
+        
+    all_buckets = sorted(list(all_buckets_set))
     existing_cav_buckets = set(df['time_window_sec'].unique())
     missing_cav_buckets = [b for b in all_buckets if b not in existing_cav_buckets]
     
@@ -193,6 +227,7 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         "raw_density_leftwards_following": True,
         "raw_density_rightwards_proceeding": True,
         "raw_density_rightwards_following": True,
+        "is_outlier": True,
         # Relative Speeds
         "relative_speed_proceeding": ":.2f",
         "relative_speed_following": ":.2f",
@@ -252,7 +287,7 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         for t_str, group in df_matched.groupby('time_window_str'):
             grey_frames[str(t_str)] = group
 
-    # Update frames to include grey points trace
+    # Update frames to include grey and outlier points traces
     for frame in fig.frames:
         frame_time = frame.name
         if frame_time in grey_frames:
@@ -269,9 +304,21 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
             grey_trace = go.Scattermap(
                 lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
             )
+            
+        if frame_time in outlier_frames:
+            g_out = outlier_frames[frame_time]
+            outlier_trace = go.Scattermap(
+                lat=g_out['lat'], lon=g_out['lon'], mode='markers',
+                marker=dict(size=8, color='darkred', opacity=0.9),
+                hovertext=g_out['track_id'].astype(str),
+                hoverinfo='text', showlegend=False
+            )
+        else:
+            outlier_trace = go.Scattermap(
+                lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
+            )
         
-        frame.data = [grey_trace] + list(frame.data)
-        frame.traces = [1, 2] # 0 is bg, 1 is grey, 2 is cavs
+        frame.data = [grey_trace, outlier_trace] + list(frame.data)
 
     # Prepare initial trace state
     first_frame_name = df['time_window_str'].iloc[0] if not df.empty else ""
@@ -289,23 +336,36 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         initial_grey_trace = go.Scattermap(
             lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
         )
+        
+    if first_frame_name in outlier_frames:
+        g_out = outlier_frames[first_frame_name]
+        initial_outlier_trace = go.Scattermap(
+            lat=g_out['lat'], lon=g_out['lon'], mode='markers',
+            marker=dict(size=8, color='darkred', opacity=0.9),
+            hovertext=g_out['track_id'].astype(str),
+            hoverinfo='text', showlegend=False
+        )
+    else:
+        initial_outlier_trace = go.Scattermap(
+            lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
+        )
 
     # Ensure background map is below the points
     fig.add_trace(bg_roads)
     fig.add_trace(initial_grey_trace)
+    fig.add_trace(initial_outlier_trace)
 
-    # Reorder initial traces: [Background Roads (0), Grey Points (1), CAV Heatmap (2)]
+    # Reorder initial traces: [Background Roads (0), Grey Points (1), White Outliers (2), CAV Heatmap (3+)]
     data_list = list(fig.data)
-    fig.data = tuple([data_list[-2], data_list[-1]] + data_list[:-2])
-    cav_traces = data_list[:-2]
+    fig.data = tuple([data_list[-3], data_list[-2], data_list[-1]] + data_list[:-3])
+    cav_traces = data_list[:-3]
     
     # Explicitly set marker size for CAVs and other points to 8
     fig.update_traces(marker=dict(size=8), selector=dict(mode='markers'))
     
     # If px generated multiple traces for some reason, we update the frame.traces to match
-    if len(cav_traces) > 1:
-        for frame in fig.frames:
-            frame.traces = [1] + list(range(2, 2 + len(cav_traces)))
+    for frame in fig.frames:
+        frame.traces = [1, 2] + list(range(3, 3 + len(cav_traces)))
 
     html_file = "pipeline_features_viz.html"
     print(f"Saving visualization to {html_file}...")

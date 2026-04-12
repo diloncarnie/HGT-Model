@@ -34,10 +34,16 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
     np.random.shuffle(unique_tracks)
     track_to_color = {tid: str(i % 10) for i, tid in enumerate(unique_tracks)}
     df['assigned_color'] = df['track_id'].map(track_to_color)
+    
+    if 'is_outlier' not in df.columns:
+        df['is_outlier'] = False
+    df.loc[df['is_outlier'] == True, 'assigned_color'] = 'Outlier'
     df['track_id_str'] = df['track_id'].astype(str)
     
     # Generate 10 nice rainbow colors
     rainbow_palette = px.colors.sample_colorscale('turbo', np.linspace(0, 1, 10))
+    color_map = {str(i): rainbow_palette[i] for i in range(10)}
+    color_map['Outlier'] = 'white'
 
     # Load and optimize network data
     edges = gpd.read_file(network_file)
@@ -58,7 +64,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
         lat="lat",
         lon="lon",
         color="assigned_color", # 10 traces instead of N
-        color_discrete_sequence=rainbow_palette,
+        color_discrete_map=color_map,
         hover_data={
             "track_id": True,
             "type": True,
@@ -71,6 +77,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
             "t_proj": ":.2f",
             "prop_dist": ":.3f",
             "rel_heading": ":.2f",
+            "is_outlier": True,
             "assigned_color": False,
             "lat": False,
             "lon": False
@@ -145,6 +152,11 @@ def main():
     
     network_path = os.path.join(args.folder, 'osm_network_filtered.gpkg')
     trajectories_path = os.path.join(args.folder, 'matched_trajectories_filtered.csv')
+    
+    if not os.path.exists(network_path):
+        network_path = os.path.join(args.folder, 'osm_network.gpkg')
+    if not os.path.exists(trajectories_path):
+        trajectories_path = os.path.join(args.folder, 'matched_trajectories.csv')
     
     visualize_map_matching(network_path, trajectories_path, args.all)
 
