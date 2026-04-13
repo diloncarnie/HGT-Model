@@ -9,7 +9,7 @@ def main():
     
     parser = argparse.ArgumentParser(description="Unify OSM network files from multiple cities into a single file")
     parser.add_argument('--folder', default="processed_data", help="Path to processing folder")
-    parser.add_argument('--filter_csvs', action='store_true', help="Filter removed segments from _processed.csv and matched_trajectories.csv files")
+    parser.add_argument('--filter_files', action='store_true', help="Filter removed segments from _processed.csv and matched_trajectories.csv files")
     args = parser.parse_args()
     
     base_dir = args.folder
@@ -136,7 +136,7 @@ def main():
             else:
                 filtered_gdfs.append(current_gdf)
                 
-            if args.filter_csvs:
+            if args.filter_files:
                 dir_path = os.path.dirname(file_path)
                 folder_name = os.path.basename(dir_path)
                 

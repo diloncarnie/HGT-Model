@@ -154,14 +154,19 @@ def process_single_folder(folder_path, config):
     print(f"\n--- Processing Folder: {folder_path} ---")
     folder_start_time = time.time()
     
-    matched_file = os.path.join(folder_path, "matched_trajectories.csv")
+    matched_file = os.path.join(folder_path, "matched_trajectories_filtered.csv")
+    if not os.path.exists(matched_file):
+        matched_file = os.path.join(folder_path, "matched_trajectories.csv")
+        
     speeds_file = os.path.join(folder_path, "empirical_free_flow_speeds.json")
     
-    if not os.path.exists(matched_file) or not os.path.exists(speeds_file):
-        print(f"Skipping {folder_path}: missing required matched_trajectories.csv or empirical_free_flow_speeds.json")
+    if not os.path.exists(matched_file):
+        print(f"Skipping {folder_path}: missing matched_trajectories_filtered.csv or matched_trajectories.csv")
+        return
+    if not os.path.exists(speeds_file):
+        print(f"Skipping {folder_path}: missing required empirical_free_flow_speeds.json")
         return
         
-    # Load the mapped dataframe with strict string typing to avoid pandas int inference on IDs
     df = pd.read_csv(matched_file, dtype={'track_id': str, 'segment_id': str})
     if df.empty:
         print("Matched trajectories file is empty.")
@@ -298,14 +303,14 @@ def main():
     
     # Discover target folders
     if os.path.isdir(args.input_path):
-        # Is it a specific folder (contains matched_trajectories.csv directly)?
-        if os.path.exists(os.path.join(args.input_path, 'matched_trajectories.csv')):
+        # Is it a specific folder?
+        if os.path.exists(os.path.join(args.input_path, 'matched_trajectories_filtered.csv')) or \
+           os.path.exists(os.path.join(args.input_path, 'matched_trajectories.csv')):
             folders = [args.input_path]
         else:
-            # Traverse to find folders with matched_trajectories.csv
             folders = []
             for root, dirs, files in os.walk(args.input_path):
-                if 'matched_trajectories.csv' in files:
+                if 'matched_trajectories_filtered.csv' in files or 'matched_trajectories.csv' in files:
                     folders.append(root)
     else:
         print(f"Error: {args.input_path} is not a valid directory.")
@@ -314,7 +319,7 @@ def main():
     folders = sorted(list(set(folders)))
     
     if not folders:
-        print("No folders with matched_trajectories.csv found.")
+        print("No folders with matched trajectories found.")
         return
         
     for folder in folders:
