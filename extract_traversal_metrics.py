@@ -9,6 +9,7 @@ from pathlib import Path
 import warnings
 import math
 from functools import partial
+import logging
 
 # Suppress warnings if needed
 warnings.filterwarnings('ignore')
@@ -41,10 +42,15 @@ def calculate_rtsm(temporal_speed, spatial_speed, temp_thresh, spat_thresh):
 def process_track(track_data, config):
     """Processes all segments for a single track_id."""
     track_id, track_df = track_data
+    
+    # Keep original index to update outliers later
+    track_df['original_index'] = track_df.index
     track_df = track_df.sort_values('time').reset_index(drop=True)
     
     traversals = []
     segment_stats = {}
+    logs = []
+    valid_original_indices = []
     
     # Identify segment transitions
     segment_changes = track_df['segment_id'] != track_df['segment_id'].shift()
@@ -52,27 +58,69 @@ def process_track(track_data, config):
     
     for group_id, group_df in track_df.groupby(segment_groups):
         if len(group_df) == 0:
-            print(f"Track {track_id} has an empty segment group (group_id={group_id}). Skipping.")
+            logs.append(f"Track {track_id} has an empty segment group (group_id={group_id}). Skipping.")
             continue
             
         segment_id = group_df['segment_id'].iloc[0]
         if segment_id not in segment_stats:
-            segment_stats[segment_id] = {'total': 0, 'invalid': 0}
+            segment_stats[segment_id] = {
+                'total': 0, 'invalid': 0, 'invalid_outlier_ratio': 0, 
+                'invalid_outlier_stop': 0, 'invalid_gap': 0, 
+                'invalid_monotonic': 0, 'invalid_bounds': 0, 'insufficient_records': 0,
+                'sum_outlier_ratio': 0.0, 'count_outlier_ratio': 0,
+                'sum_outlier_stop': 0.0, 'count_outlier_stop': 0
+            }
         segment_stats[segment_id]['total'] += 1
         
         segment_length = group_df['segment_length'].iloc[0]
+        
+        # Outlier Traversal Check: Proportion-based & Kinematic-Gated rejection
+        if 'is_outlier' in group_df.columns:
+            outlier_ratio = group_df['is_outlier'].mean()
+            segment_stats[segment_id]['sum_outlier_ratio'] += float(outlier_ratio)
+            segment_stats[segment_id]['count_outlier_ratio'] += 1
+            
+            outlier_stopped_mask = group_df['is_outlier'] & (group_df['speed'] < config['stopped_speed_threshold'])
+            max_outlier_stop = 0.0
+            if outlier_stopped_mask.any():
+                current_outlier_stop = 0.0
+                times = group_df['time'].values
+                mask_vals = outlier_stopped_mask.values
+                
+                for i in range(1, len(group_df)):
+                    if mask_vals[i] and mask_vals[i-1]:
+                        current_outlier_stop += times[i] - times[i-1]
+                    else:
+                        max_outlier_stop = max(max_outlier_stop, current_outlier_stop)
+                        current_outlier_stop = 0.0
+                max_outlier_stop = max(max_outlier_stop, current_outlier_stop)
+                
+                segment_stats[segment_id]['sum_outlier_stop'] += float(max_outlier_stop)
+                segment_stats[segment_id]['count_outlier_stop'] += 1
+                    
+            if outlier_ratio > config.get('max_outlier_proportion', 0.2):
+                segment_stats[segment_id]['invalid'] += 1
+                segment_stats[segment_id]['invalid_outlier_ratio'] += 1
+                continue
+                
+            if max_outlier_stop > config.get('max_outlier_stop_duration', 5.0):
+                segment_stats[segment_id]['invalid'] += 1
+                segment_stats[segment_id]['invalid_outlier_stop'] += 1
+                continue
         
         # Gap filtering check to filter out single traversals
         time_diffs = group_df['time'].diff()
         if (time_diffs > config['gap_threshold']).any():
             segment_stats[segment_id]['invalid'] += 1
+            segment_stats[segment_id]['invalid_gap'] += 1
             continue
             
         # Monotonicity check
         valid_group = group_df[group_df['t_proj'] >= group_df['t_proj'].cummax()].copy()
         if len(valid_group) == 0:
-            print(f"Track {track_id}, segment {segment_id} has no valid monotonic records. Skipping.")
+            logs.append(f"Track {track_id}, segment {segment_id} has no valid monotonic records. Skipping.")
             segment_stats[segment_id]['invalid'] += 1
+            segment_stats[segment_id]['invalid_monotonic'] += 1
             continue
             
         first_idx = valid_group.index[0]
@@ -110,19 +158,21 @@ def process_track(track_data, config):
                 
         # Quit if incomplete traversal (missing prev/next and not within threshold) or not enough records to interpolate
         if not has_prev or not has_following or len(records) < 2:
-            if len(records) < 2:
-                print(f"Track {track_id}, segment {segment_id} has insufficient records for interpolation (record_count={len(records)}). Skipping.")
             segment_stats[segment_id]['invalid'] += 1
+            if len(records) < 2:
+                segment_stats[segment_id]['insufficient_records'] += 1
+            else:
+                segment_stats[segment_id]['invalid_bounds'] += 1
             continue
         
         
             
         traversal_df = pd.DataFrame(records)
         
-        # Adjust offsets: distanceOffsets[i] = max(offset, prev + 0.001)
+        # Adjust offsets: distanceOffsets[i] = max(offset, prev + config['monotonicity_offset'])
         t_projs = traversal_df['t_proj'].values.copy()
         for i in range(1, len(t_projs)):
-            t_projs[i] = max(t_projs[i], t_projs[i-1] + 0.001)
+            t_projs[i] = max(t_projs[i], t_projs[i-1] + config['monotonicity_offset'])
         traversal_df['t_proj'] = t_projs
         
         t_proj = traversal_df['t_proj'].values
@@ -161,7 +211,7 @@ def process_track(track_data, config):
                 
         except Exception as e:
             # Fallback on error
-            print(f"Interpolation error for track {track_id}, segment {segment_id}: {e}")
+            logs.append(f"Interpolation error for track {track_id}, segment {segment_id}: {e}")
             total_dist = t_proj[-1] - t_proj[0]
             total_t = times[-1] - times[0]
             if total_t > 0:
@@ -174,10 +224,20 @@ def process_track(track_data, config):
         # Calculate stopping duration
         vg_times = valid_group['time'].values
         vg_speeds = valid_group['speed'].values
-        stopping_duration = 0.0
+        max_stopping_duration = 0.0
+        current_stop_duration = 0.0
         for i in range(1, len(valid_group)):
             if vg_speeds[i] < config['stopped_speed_threshold'] and vg_speeds[i-1] < config['stopped_speed_threshold']:
-                stopping_duration += vg_times[i] - vg_times[i-1]
+                current_stop_duration += vg_times[i] - vg_times[i-1]
+            else:
+                if current_stop_duration > max_stopping_duration:
+                    max_stopping_duration = current_stop_duration
+                current_stop_duration = 0.0
+                
+        if current_stop_duration > max_stopping_duration:
+            max_stopping_duration = current_stop_duration
+            
+        stopping_duration = max_stopping_duration
 
         traversals.append({
             'segment_id': segment_id,
@@ -189,47 +249,152 @@ def process_track(track_data, config):
             'traversal_time': traversal_time,
             'segment_length': segment_length
         })
+        valid_original_indices.extend(group_df['original_index'].tolist())
         
-    return traversals, segment_stats
+    return traversals, segment_stats, logs, valid_original_indices
 
 def process_file(csv_path, config):
+    out_dir = Path(csv_path).parent
+    log_path = out_dir / 'extraction.log'
+    
+    # Setup standard python logging
+    logger = logging.getLogger(f"extraction_{csv_path}")
+    logger.setLevel(logging.INFO)
+    
+    # Clear existing handlers to prevent duplicate lines if function runs multiple times
+    if logger.hasHandlers():
+        logger.handlers.clear()
+        
+    fh = logging.FileHandler(log_path, mode='w', encoding='utf-8')
+    fh.setLevel(logging.INFO)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter('%(message)s')
+    fh.setFormatter(formatter)
+    ch.setFormatter(formatter)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+        
+    logger.info(f"--- Extraction Log for {csv_path} ---")
+    
     t0 = time.time()
-    print(f"Processing: {csv_path}")
+    logger.info(f"Processing: {csv_path}")
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
-        print(f"Error reading {csv_path}: {e}")
-        return 0.0
+        logger.error(f"Error reading {csv_path}: {e}")
+        return 0.0, 0.0, 0.0, [], []
 
-    print(f"Loaded {len(df)} rows. Time: {time.time() - t0:.2f}s")
+    logger.info(f"Loaded {len(df)} rows. Time: {time.time() - t0:.2f}s")
     t1 = time.time()
     
     # Process by track_id to allow matching previous/following records correctly
-    grouped = list(df.groupby('track_id'))
-    print(f"Grouped into {len(grouped)} tracks. Time: {time.time() - t1:.2f}s")
+    grouped = df.groupby('track_id')
+    logger.info(f"Grouped into {grouped.ngroups} tracks. Time: {time.time() - t1:.2f}s")
     
     t2 = time.time()
     valid_traversals = []
+    all_valid_indices = []
     global_segment_stats = {}
     
     process_func = partial(process_track, config=config)
     with mp.Pool() as pool:
-        results = pool.map(process_func, grouped)
+        for res_traversals, res_stats, res_logs, res_indices in pool.imap_unordered(process_func, grouped):
+            for msg in res_logs:
+                logger.info(msg)
+            valid_traversals.extend(res_traversals)
+            all_valid_indices.extend(res_indices)
+            for sid, stats in res_stats.items():
+                if sid not in global_segment_stats:
+                    global_segment_stats[sid] = {
+                        'total': 0, 'invalid': 0, 'invalid_outlier_ratio': 0, 
+                        'invalid_outlier_stop': 0, 'invalid_gap': 0,
+                        'invalid_monotonic': 0, 'invalid_bounds': 0, 'insufficient_records': 0,
+                        'sum_outlier_ratio': 0.0, 'count_outlier_ratio': 0,
+                        'sum_outlier_stop': 0.0, 'count_outlier_stop': 0
+                    }
+                global_segment_stats[sid]['total'] += stats['total']
+                global_segment_stats[sid]['invalid'] += stats['invalid']
+                global_segment_stats[sid]['invalid_outlier_ratio'] += stats['invalid_outlier_ratio']
+                global_segment_stats[sid]['invalid_outlier_stop'] += stats['invalid_outlier_stop']
+                global_segment_stats[sid]['invalid_gap'] += stats['invalid_gap']
+                global_segment_stats[sid]['invalid_monotonic'] += stats['invalid_monotonic']
+                global_segment_stats[sid]['invalid_bounds'] += stats['invalid_bounds']
+                global_segment_stats[sid]['insufficient_records'] += stats['insufficient_records']
+                
+                global_segment_stats[sid]['sum_outlier_ratio'] += stats['sum_outlier_ratio']
+                global_segment_stats[sid]['count_outlier_ratio'] += stats['count_outlier_ratio']
+                global_segment_stats[sid]['sum_outlier_stop'] += stats['sum_outlier_stop']
+                global_segment_stats[sid]['count_outlier_stop'] += stats['count_outlier_stop']
+                
+    total_sum_ratio = sum(s['sum_outlier_ratio'] for s in global_segment_stats.values())
+    total_count_ratio = sum(s['count_outlier_ratio'] for s in global_segment_stats.values())
+    total_sum_stop = sum(s['sum_outlier_stop'] for s in global_segment_stats.values())
+    total_count_stop = sum(s['count_outlier_stop'] for s in global_segment_stats.values())
+    
+    file_avg_ratio = total_sum_ratio / total_count_ratio if total_count_ratio > 0 else 0.0
+    file_avg_stop = total_sum_stop / total_count_stop if total_count_stop > 0 else 0.0
+
+    top_ratio_segs = sorted(global_segment_stats.items(), key=lambda x: x[1]['invalid_outlier_ratio'], reverse=True)
+    top_10_ratio = [(sid, stats['invalid_outlier_ratio']) for sid, stats in top_ratio_segs if stats['invalid_outlier_ratio'] > 0][:10]
+    
+    top_stop_segs = sorted(global_segment_stats.items(), key=lambda x: x[1]['invalid_outlier_stop'], reverse=True)
+    top_10_stop = [(sid, stats['invalid_outlier_stop']) for sid, stats in top_stop_segs if stats['invalid_outlier_stop'] > 0][:10]
+    
+    logger.info("\n--- Top 10 Outlier Ratio Filled Segments ---")
+    if top_10_ratio:
+        for sid, count in top_10_ratio:
+            logger.info(f"Segment {sid}: {count} traversals removed")
+    else:
+        logger.info("None")
         
-    for res_traversals, res_stats in results:
-        valid_traversals.extend(res_traversals)
-        for sid, stats in res_stats.items():
-            if sid not in global_segment_stats:
-                global_segment_stats[sid] = {'total': 0, 'invalid': 0}
-            global_segment_stats[sid]['total'] += stats['total']
-            global_segment_stats[sid]['invalid'] += stats['invalid']
+    logger.info("\n--- Top 10 Outlier Stopping Segments ---")
+    if top_10_stop:
+        for sid, count in top_10_stop:
+            logger.info(f"Segment {sid}: {count} traversals removed")
+    else:
+        logger.info("None")
+        
+    logger.info("\n--- File Outlier Statistics ---")
+    logger.info(f"Average Outlier Proportion: {file_avg_ratio:.2%}")
+    logger.info(f"Average Outlier Stop Duration: {file_avg_stop:.2f}s")
+        
+    top_prop_segs = sorted(
+        global_segment_stats.items(), 
+        key=lambda x: (x[1]['invalid'] / x[1]['total'] if x[1]['total'] > 0 else 0, x[1]['total']), 
+        reverse=True
+    )
+    top_10_prop = [(sid, stats) for sid, stats in top_prop_segs if stats['invalid'] > 0][:10]
+    
+    logger.info("\n--- Top 10 Segments by Invalid Traversal Proportion ---")
+    if top_10_prop:
+        for sid, stats in top_10_prop:
+            prop = stats['invalid'] / stats['total']
+            logger.info(f"Segment {sid}: {prop:.1%} removed ({stats['invalid']}/{stats['total']})")
+            logger.info(f"    - Outlier Ratio: {stats['invalid_outlier_ratio']}")
+            logger.info(f"    - Outlier Stop: {stats['invalid_outlier_stop']}")
+            logger.info(f"    - Gap Threshold: {stats['invalid_gap']}")
+            logger.info(f"    - Monotonicity: {stats['invalid_monotonic']}")
+            logger.info(f"    - Incomplete Traversal (Missing Bounds): {stats['invalid_bounds']}")
+            logger.info(f"    - Insufficient Records (< 2): {stats['insufficient_records']}")
+    else:
+        logger.info("None")
+    logger.info("\n")
             
-    print(f"Spline fitting and traversal extraction took {time.time() - t2:.2f}s")
-    print(f"Extracted {len(valid_traversals)} valid traversals.")
+    logger.info(f"Spline fitting and traversal extraction took {time.time() - t2:.2f}s")
+    logger.info(f"Extracted {len(valid_traversals)} valid traversals.")
     
     if not valid_traversals:
-        print("No valid traversals found.")
-        return 0.0
+        logger.info("No valid traversals found.")
+        return 0.0, file_avg_ratio, file_avg_stop, list(global_segment_stats.keys()), list(global_segment_stats.keys())
+        
+    if config.get('update_traversals') and all_valid_indices:
+        logger.info(f"Updating {len(all_valid_indices)} valid trajectory points to is_outlier=False...")
+        df.loc[all_valid_indices, 'is_outlier'] = False
+        updated_csv_path = out_dir / 'matched_trajectories_updated.csv'
+        df.to_csv(updated_csv_path, index=False)
+        logger.info(f"Saved updated trajectories to {updated_csv_path}")
 
     traversals_df = pd.DataFrame(valid_traversals)
     
@@ -251,8 +416,8 @@ def process_file(csv_path, config):
         if len(times) > 1:
             filtered_times = [t for t in times if t > config['min_traversal_time']]
             if len(filtered_times) > 0:
-                p5_time = np.percentile(times, 5)
-                red_light_duration = np.percentile(seg_df['stopping_duration'], 95)
+                p5_time = np.percentile(times, config['percentile_temporal'])
+                red_light_duration = np.percentile(seg_df['stopping_duration'], config['percentile_red_light'])
                 if red_light_duration > file_max_red_light_duration:
                     file_max_red_light_duration = red_light_duration
                     file_max_red_light_segment_id = segment_id
@@ -260,11 +425,11 @@ def process_file(csv_path, config):
                 if ideal_time > 0:
                     temp_thresh = seg_length / ideal_time
                 else:
-                    print(f"Segment {segment_id} has non-positive ideal time for temporal threshold calculation (p5_time={p5_time}, red_light_duration={red_light_duration})")
+                    logger.info(f"Segment {segment_id} has non-positive ideal time for temporal threshold calculation (p5_time={p5_time}, red_light_duration={red_light_duration})")
             else:
-                print(f"Segment {segment_id} has no traversals longer than 2.0 seconds for temporal threshold calculation (count={len(times)}, length={seg_length})")
+                logger.info(f"Segment {segment_id} has no traversals longer than 2.0 seconds for temporal threshold calculation (count={len(times)}, length={seg_length})")
         else:
-            print(f"Segment {segment_id} has insufficient traversals for temporal threshold calculation (count={len(times)}, length={seg_length})")
+            logger.info(f"Segment {segment_id} has insufficient traversals for temporal threshold calculation (count={len(times)}, length={seg_length})")
                     
         # Spatial Threshold
         spat_thresh = None
@@ -272,15 +437,15 @@ def process_file(csv_path, config):
         if len(seg_df) > 1 and temp_thresh is not None:
             good_temp_df = seg_df[seg_df['temporal_mean_speed'] >= temp_thresh]
             if len(good_temp_df) > 0:
-                spat_thresh = np.percentile(good_temp_df['spatial_mean_speed'], 5)
-                free_flow_speed = np.percentile(good_temp_df['spatial_mean_speed'], 85)
+                spat_thresh = np.percentile(good_temp_df['spatial_mean_speed'], config['percentile_spatial'])
+                free_flow_speed = np.percentile(good_temp_df['spatial_mean_speed'], config['percentile_free_flow'])
             else:
-                print(f"Segment {segment_id} has no traversals meeting temporal threshold for spatial threshold calculation (count={len(good_temp_df)}, temp_thresh={temp_thresh}, length={seg_length})")
+                logger.info(f"Segment {segment_id} has no traversals meeting temporal threshold for spatial threshold calculation (count={len(good_temp_df)}, temp_thresh={temp_thresh}, length={seg_length})")
         else:
-            print(f"Segment {segment_id} has insufficient data for spatial threshold calculation (count={len(seg_df)}, temp_thresh={temp_thresh}, lenght={seg_length})")
+            logger.info(f"Segment {segment_id} has insufficient data for spatial threshold calculation (count={len(seg_df)}, temp_thresh={temp_thresh}, lenght={seg_length})")
                 
         if temp_thresh is None or spat_thresh is None:
-            print(f"Segment {segment_id} has invalid thresholds. Total={global_segment_stats[segment_id]['total']} Invalid={global_segment_stats[segment_id]['invalid']}.  Adding with default thresholds.")
+            logger.info(f"Segment {segment_id} has invalid thresholds. Total={global_segment_stats[segment_id]['total']} Invalid={global_segment_stats[segment_id]['invalid']}.  Adding with default thresholds.")
             temp_thresh = -1.0
             spat_thresh = -1.0
             
@@ -298,7 +463,7 @@ def process_file(csv_path, config):
         
         sid_int = int(segment_id)
         if sid_int not in segment_thresholds:
-            print(f"Segment {segment_id} has no valid traversals. Total={stats['total']}  Invalid={stats['invalid']}. Adding with default thresholds.")
+            logger.info(f"Segment {segment_id} has no valid traversals. Total={stats['total']}  Invalid={stats['invalid']}. Adding with default thresholds.")
             segment_thresholds[sid_int] = {
                 'temporal_threshold': -1.0,
                 'spatial_threshold': -1.0,
@@ -308,7 +473,17 @@ def process_file(csv_path, config):
                 'invalid_traversals': stats['invalid']
             }
 
-    print(f"Threshold calculation took {time.time() - t3:.2f}s")
+    invalid_segments_in_file = []
+    low_volume_segments_in_file = []
+    for sid_int, thresholds in segment_thresholds.items():
+        if thresholds['temporal_threshold'] == -1.0 or thresholds['spatial_threshold'] == -1.0:
+            invalid_segments_in_file.append(str(sid_int))
+            
+        valid_count = thresholds['total_traversals'] - thresholds['invalid_traversals']
+        if valid_count < 10:
+            low_volume_segments_in_file.append(str(sid_int))
+
+    logger.info(f"Threshold calculation took {time.time() - t3:.2f}s")
     
     t4 = time.time()
     # RTSM Calculation
@@ -321,9 +496,7 @@ def process_file(csv_path, config):
         rtsm_values.append(rtsm)
         
     traversals_df['rtsm'] = rtsm_values
-    print(f"RTSM Calculation took {time.time() - t4:.2f}s")
-    
-    out_dir = Path(csv_path).parent
+    logger.info(f"RTSM Calculation took {time.time() - t4:.2f}s")
     
     with open(out_dir / 'segment_thresholds.json', 'w') as f:
         json.dump(segment_thresholds, f, indent=4)
@@ -331,17 +504,18 @@ def process_file(csv_path, config):
     out_cols = ['segment_id', 'track_id', 'timestamp', 'temporal_mean_speed', 'spatial_mean_speed', 'rtsm']
     traversals_df.sort_values('segment_id')[out_cols].to_csv(out_dir / 'traversal_metrics.csv', index=False)
         
-    print(f"Total time for {csv_path}: {time.time() - t0:.2f}s\n")
+    logger.info(f"Total time for {csv_path}: {time.time() - t0:.2f}s\n")
     
     if file_max_red_light_duration > 0:
-        print(f"Max red light duration for this file: {file_max_red_light_duration:.2f}s (Segment ID: {file_max_red_light_segment_id})\n")
+        logger.info(f"Max red light duration for this file: {file_max_red_light_duration:.2f}s (Segment ID: {file_max_red_light_segment_id})\n")
         
-    return file_max_red_light_duration
+    return file_max_red_light_duration, file_avg_ratio, file_avg_stop, invalid_segments_in_file, low_volume_segments_in_file
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract vehicle traversal metrics from matched trajectories.")
     parser.add_argument("--file", type=str, help="Path to a single matched_trajectories.csv file")
     parser.add_argument("--folder", type=str, help="Root directory to search recursively for matched_trajectories.csv")
+    parser.add_argument("--update_traversals", action="store_true", help="Update valid traversals to have is_outlier=False and save to matched_trajectories_updated.csv")
     
     args = parser.parse_args()
     
@@ -349,28 +523,98 @@ if __name__ == "__main__":
         "gap_threshold": 30.0,
         "min_edge_threshold": 8.0,
         "max_edge_threshold": 25.0,
-        "edge_prop_threshold": 0.3,
+        "edge_prop_threshold": 0.2,
         "connection_length_threshold": 5.0,
         "speed_sample_interval": 10.0,
         "stopped_speed_threshold": 0.1,
-        "min_traversal_time": 2.0
+        "min_traversal_time": 2.0,
+        "monotonicity_offset": 0.001,
+        "percentile_temporal": 5,
+        "percentile_red_light": 95,
+        "percentile_spatial": 5,
+        "percentile_free_flow": 85,
+        "max_outlier_proportion": 0.50,
+        "max_outlier_stop_duration": 5.0,
+        "update_traversals": args.update_traversals
     }
     
     max_red_light_durations = []
+    file_avg_ratios = []
+    file_avg_stops = []
+    invalid_segments_tracker = {}
+    low_volume_segments_tracker = {}
 
     if args.file:
-        res = process_file(args.file, config)
-        if res > 0:
-            max_red_light_durations.append(res)
+        csv_path = Path(args.file)
+        if csv_path.exists():
+            res = process_file(csv_path, config)
+            if isinstance(res, tuple) and len(res) == 5:
+                rl, a_ratio, a_stop, inv_segs, low_vol_segs = res
+                if rl > 0:
+                    max_red_light_durations.append(rl)
+                file_avg_ratios.append(a_ratio)
+                file_avg_stops.append(a_stop)
+                for seg in inv_segs:
+                    if seg not in invalid_segments_tracker:
+                        invalid_segments_tracker[seg] = []
+                    invalid_segments_tracker[seg].append(csv_path.name)
+                for seg in low_vol_segs:
+                    if seg not in low_volume_segments_tracker:
+                        low_volume_segments_tracker[seg] = []
+                    low_volume_segments_tracker[seg].append(csv_path.name)
     elif args.folder:
         root_path = Path(args.folder)
-        for csv_path in root_path.rglob("matched_trajectories_filtered.csv"):
-            res = process_file(csv_path, config)
-            if res > 0:
-                max_red_light_durations.append(res)
+        # Search for all subdirectories containing either file
+        for subdir in root_path.rglob("*"):
+            if subdir.is_dir():
+                filtered_path = subdir / "matched_trajectories_filtered.csv"
+                unfiltered_path = subdir / "matched_trajectories.csv"
+                
+                target_path = None
+                if filtered_path.exists():
+                    target_path = filtered_path
+                elif unfiltered_path.exists():
+                    target_path = unfiltered_path
+                
+                if target_path:
+                    res = process_file(target_path, config)
+                    if isinstance(res, tuple) and len(res) == 5:
+                        rl, a_ratio, a_stop, inv_segs, low_vol_segs = res
+                        if rl > 0:
+                            max_red_light_durations.append(rl)
+                        file_avg_ratios.append(a_ratio)
+                        file_avg_stops.append(a_stop)
+                        for seg in inv_segs:
+                            if seg not in invalid_segments_tracker:
+                                invalid_segments_tracker[seg] = []
+                            invalid_segments_tracker[seg].append(target_path.parent.name)
+                        for seg in low_vol_segs:
+                            if seg not in low_volume_segments_tracker:
+                                low_volume_segments_tracker[seg] = []
+                            low_volume_segments_tracker[seg].append(target_path.parent.name)
     else:
         print("Please provide either --file or --folder")
         
     if len(max_red_light_durations) > 1:
         avg_max_red_light = sum(max_red_light_durations) / len(max_red_light_durations)
         print(f"Average of max red light durations across {len(max_red_light_durations)} files: {avg_max_red_light:.2f}s")
+        
+    if len(file_avg_ratios) > 0:
+        overall_avg_ratio = sum(file_avg_ratios) / len(file_avg_ratios)
+        overall_avg_stop = sum(file_avg_stops) / len(file_avg_stops)
+        print(f"Average of outlier proportions across {len(file_avg_ratios)} files: {overall_avg_ratio:.2%}")
+        print(f"Average of outlier stop durations across {len(file_avg_stops)} files: {overall_avg_stop:.2f}s")
+        
+    if invalid_segments_tracker:
+        print("\n--- Invalid Segments Across Files ---")
+        for seg, files in sorted(invalid_segments_tracker.items(), key=lambda x: len(x[1]), reverse=True):
+            print(f"Segment {seg} was invalid in {len(files)} files:")
+            for f in files:
+                print(f"  - {f}")
+                
+    if low_volume_segments_tracker:
+        print("\n--- Low Volume Segments (< 10 Valid Traversals) ---")
+        for seg, files in sorted(low_volume_segments_tracker.items(), key=lambda x: len(x[1]), reverse=True):
+            print(f"Segment {seg} had < 10 valid traversals in {len(files)} files:")
+            for f in files:
+                print(f"  - {f}")
