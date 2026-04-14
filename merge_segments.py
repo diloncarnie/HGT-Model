@@ -44,12 +44,12 @@ def main():
         is_succ = True
         
         # Prefer merging into the first successor
-        if s_adj.get('successors'):
-            t_id_original = s_adj['successors'][0]
+        if s_adj.get('to'):
+            t_id_original = s_adj['to'][0]
             is_succ = True
         # Fallback to the first predecessor
-        elif s_adj.get('predecessors'):
-            t_id_original = s_adj['predecessors'][0]
+        elif s_adj.get('from'):
+            t_id_original = s_adj['from'][0]
             is_succ = False
             
         if not t_id_original:

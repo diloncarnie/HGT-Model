@@ -6,6 +6,7 @@ import geopandas as gpd
 import os
 import json
 import numpy as np
+import re
 
 def visualize_adjacency(network_file, adjacency_file):
     if not os.path.exists(network_file):
@@ -39,10 +40,13 @@ def visualize_adjacency(network_file, adjacency_file):
             return f"{len(chain)} segments ({total_len:.1f}m): {chain}"
         return f"{len(chain)} segments: {chain}"
 
-    edges['successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'successors'))
-    edges['predecessors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'predecessors'))
-    edges['intersects_in_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'intersects_in'))
-    edges['intersects_out_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'intersects_out'))
+    edges['to_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'to'))
+    edges['from_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'from'))
+    edges['crossed_by_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'crossed_by'))
+    edges['turns_into_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'turns_into'))
+    edges['merges_into_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'merges_into'))
+    edges['u_turns_into_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'u_turns_into'))
+    edges['crosses_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'crosses'))
     edges['opposite_direction_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'opposite_direction'))
     edges['banned_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'banned_successors'))
     edges['only_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'only_successors'))
@@ -61,6 +65,7 @@ def visualize_adjacency(network_file, adjacency_file):
     lats = []
     lons = []
     geo_map = {}
+    osmid_map = {}
     
     for idx, row in edges.iterrows():
         geom = row.geometry
@@ -109,6 +114,11 @@ def visualize_adjacency(network_file, adjacency_file):
                 shifted_coords.append([None, None])
                 
         geo_map[row['segment_id_str']] = shifted_coords
+        
+        # Safely extract all numeric OSM Way IDs (in case OSMnx merged them into a string list like "[123, 456]")
+        osmid_raw = str(row.get('osmid', ''))
+        matches = re.findall(r'\d+', osmid_raw)
+        osmid_map[row['segment_id_str']] = matches if matches else []
 
     edges['lat'] = lats
     edges['lon'] = lons
@@ -123,12 +133,16 @@ def visualize_adjacency(network_file, adjacency_file):
             "length": True,
             "highway": True,
             "oneway": True,
+            "lanes": True,
             "turn:lanes": True,
             "turn": True,
-            "successors_info": True,
-            "predecessors_info": True,
-            "intersects_in_info": True,
-            "intersects_out_info": True,
+            "to_info": True,
+            "from_info": True,
+            "crossed_by_info": True,
+            "turns_into_info": True,
+            "merges_into_info": True,
+            "u_turns_into_info": True,
+            "crosses_info": True,
             "banned_successors_info": True,
             "only_successors_info": True,
             "opposite_direction_info": True,
@@ -173,10 +187,12 @@ def visualize_adjacency(network_file, adjacency_file):
     js_injection = f"""<div style="padding: 10px; text-align: center; font-family: sans-serif;">
         <input type="text" id="segIdInput" placeholder="Enter Segment ID" style="padding: 5px; width: 200px;">
         <button id="searchButton" style="padding: 5px 10px;">Search & Highlight</button>
+        <span id="osmLinkContainer" style="margin-left: 20px; font-size: 15px;"></span>
     </div>
     <script>
         var adjacency = {json.dumps(adjacency)};
         var geoMap = {json.dumps(geo_map)};
+        var osmidMap = {json.dumps(osmid_map)};
         
         document.addEventListener('DOMContentLoaded', function() {{
             var plotEl = document.getElementsByClassName('plotly-graph-div')[0];
@@ -227,7 +243,20 @@ def visualize_adjacency(network_file, adjacency_file):
 
         function highlightNeighbors(egoId, plotEl) {{
             var egoIdStr = String(egoId);
-            var adj = adjacency[egoIdStr] || {{successors: [], predecessors: [], intersects_in: [], intersects_out: [], opposite_direction: [], banned_successors: [], only_successors: []}};
+            var adj = adjacency[egoIdStr] || {{to: [], from: [], merges_into: [], crossed_by: [], turns_into: [], u_turns_into: [], crosses: [], opposite_direction: [], banned_successors: [], only_successors: []}};
+            
+            // Update OSM Links in the control bar
+            var osmids = osmidMap[egoIdStr];
+            var linkContainer = document.getElementById('osmLinkContainer');
+            if (osmids && osmids.length > 0 && linkContainer) {{
+                var linksHTML = '🌍 View Segment ' + egoIdStr + ': ';
+                var linkArray = osmids.map(function(id) {{
+                    return '<a href="https://www.openstreetmap.org/way/' + id + '" target="_blank" style="color: #007bff; text-decoration: none; font-weight: bold;">OSM Way ' + id + '</a>';
+                }});
+                linkContainer.innerHTML = linksHTML + linkArray.join(' | ');
+            }} else if (linkContainer) {{
+                linkContainer.innerHTML = '';
+            }}
             
             var traces = [];
             
@@ -271,7 +300,7 @@ def visualize_adjacency(network_file, adjacency_file):
             }}
             
             // 2. Successors (Green)
-            adj.successors.forEach(sid => {{
+            adj.to.forEach(sid => {{
                 if (geoMap[sid]) {{
                     traces.push({{
                         type: 'scattermap',
@@ -279,13 +308,13 @@ def visualize_adjacency(network_file, adjacency_file):
                         lon: geoMap[sid].map(p => p[1]),
                         mode: 'lines',
                         line: {{width: 6, color: 'lime'}},
-                        name: 'Successor: ' + sid
+                        name: egoIdStr + ' to ' + sid
                     }});
                 }}
             }});
             
             // 3. Predecessors (Red)
-            adj.predecessors.forEach(sid => {{
+            adj.from.forEach(sid => {{
                 if (geoMap[sid]) {{
                     traces.push({{
                         type: 'scattermap',
@@ -293,13 +322,13 @@ def visualize_adjacency(network_file, adjacency_file):
                         lon: geoMap[sid].map(p => p[1]),
                         mode: 'lines',
                         line: {{width: 6, color: 'red'}},
-                        name: 'Predecessor: ' + sid
+                        name: egoIdStr + ' from ' + sid
                     }});
                 }}
             }});
 
             // 4. Intersects In (Cyan) - Segments flowing INTO the ego segment intersection
-            (adj.intersects_in || []).forEach(sid => {{
+            (adj.crossed_by || []).forEach(sid => {{
                 if (geoMap[sid]) {{
                     traces.push({{
                         type: 'scattermap',
@@ -307,13 +336,13 @@ def visualize_adjacency(network_file, adjacency_file):
                         lon: geoMap[sid].map(p => p[1]),
                         mode: 'lines',
                         line: {{width: 5, color: 'cyan'}},
-                        name: 'Intersects (In): ' + sid
+                        name: egoIdStr + ' crossed_by ' + sid
                     }});
                 }}
             }});
 
             // 5. Intersects Out (Magenta) - Segments flowing OUT OF the ego segment intersection
-            (adj.intersects_out || []).forEach(sid => {{
+            (adj.turns_into || []).forEach(sid => {{
                 if (geoMap[sid]) {{
                     traces.push({{
                         type: 'scattermap',
@@ -321,7 +350,7 @@ def visualize_adjacency(network_file, adjacency_file):
                         lon: geoMap[sid].map(p => p[1]),
                         mode: 'lines',
                         line: {{width: 5, color: 'magenta'}},
-                        name: 'Intersects (Out): ' + sid
+                        name: egoIdStr + ' turns_into ' + sid
                     }});
                 }}
             }});
@@ -365,6 +394,48 @@ def visualize_adjacency(network_file, adjacency_file):
                         mode: 'lines',
                         line: {{width: 6, color: 'blue'}},
                         name: 'Mandatory Turn: ' + sid
+                    }});
+                }}
+            }});
+
+            // 8. Merging Into (Orange)
+            (adj.merges_into || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 7, color: 'orange'}},
+                        name: egoIdStr + ' merges_into ' + sid
+                    }});
+                }}
+            }});
+
+            // 9. U-Turns (Brown)
+            (adj.u_turns_into || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 6, color: 'brown'}},
+                        name: egoIdStr + ' u-turns_into ' + sid
+                    }});
+                }}
+            }});
+
+            // 10. Crosses (Teal)
+            (adj.crosses || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 6, color: 'teal'}},
+                        name: egoIdStr + ' crosses ' + sid
                     }});
                 }}
             }});

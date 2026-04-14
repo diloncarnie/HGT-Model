@@ -44,7 +44,74 @@ def get_osm_network():
             edges_to_keep.append((u, v, k))
             
     filtered_graph = graph.edge_subgraph(edges_to_keep).copy()
-    filtered_graph = ox.simplify_graph(filtered_graph)
+    
+    # Propagate 'lanes' values to missing segments along continuous topological paths
+    # to allow OSMnx to merge them, while preventing merges of different lane counts.
+    changed = True
+    iterations = 0
+    while changed and iterations < 10:
+        changed = False
+        iterations += 1
+        for node in filtered_graph.nodes():
+            in_edges = list(filtered_graph.in_edges(node, keys=True, data=True))
+            out_edges = list(filtered_graph.out_edges(node, keys=True, data=True))
+            
+            # Simple one-way continuation
+            if len(in_edges) == 1 and len(out_edges) == 1:
+                d1 = in_edges[0][3]
+                d2 = out_edges[0][3]
+                if 'lanes' in d1 and 'lanes' not in d2:
+                    d2['lanes'] = d1['lanes']
+                    changed = True
+                elif 'lanes' in d2 and 'lanes' not in d1:
+                    d1['lanes'] = d2['lanes']
+                    changed = True
+                    
+            # Simple two-way continuation
+            elif len(in_edges) == 2 and len(out_edges) == 2:
+                in_nodes = {e[0] for e in in_edges}
+                out_nodes = {e[1] for e in out_edges}
+                
+                if in_nodes == out_nodes and len(in_nodes) == 2:
+                    n1, n2 = list(in_nodes)
+                    
+                    for start_n, end_n in [(n1, n2), (n2, n1)]:
+                        in_dir = next((e for e in in_edges if e[0] == start_n), None)
+                        out_dir = next((e for e in out_edges if e[1] == end_n), None)
+                        if in_dir and out_dir:
+                            d_in = in_dir[3]
+                            d_out = out_dir[3]
+                            if 'lanes' in d_in and 'lanes' not in d_out:
+                                d_out['lanes'] = d_in['lanes']
+                                changed = True
+                            elif 'lanes' in d_out and 'lanes' not in d_in:
+                                d_in['lanes'] = d_out['lanes']
+                                changed = True
+                                
+            # Cross-intersection propagation for matching roads (based on name or OSM ID)
+            if len(in_edges) > 0 and len(out_edges) > 0:
+                for _, _, _, d_in in in_edges:
+                    for _, _, _, d_out in out_edges:
+                        def get_first(val):
+                            return val[0] if isinstance(val, list) else val
+                            
+                        name_in = get_first(d_in.get('name'))
+                        name_out = get_first(d_out.get('name'))
+                        osmid_in = get_first(d_in.get('osmid'))
+                        osmid_out = get_first(d_out.get('osmid'))
+                        
+                        is_same_name = bool(name_in and name_out and name_in == name_out)
+                        is_same_way = bool(osmid_in and osmid_out and str(osmid_in) == str(osmid_out))
+                        
+                        if is_same_name or is_same_way:
+                            if 'lanes' in d_in and 'lanes' not in d_out:
+                                d_out['lanes'] = d_in['lanes']
+                                changed = True
+                            elif 'lanes' in d_out and 'lanes' not in d_in:
+                                d_in['lanes'] = d_out['lanes']
+                                changed = True
+                                
+    filtered_graph = ox.simplify_graph(filtered_graph, edge_attrs_differ=['lanes'])
     graph_utm = ox.project_graph(filtered_graph)
     
     nodes, edges = ox.graph_to_gdfs(graph_utm)
@@ -54,9 +121,9 @@ def get_osm_network():
     if 'length' not in edges.columns:
         edges['length'] = edges.geometry.length
     if 'lanes' not in edges.columns:
-        edges['lanes'] = 2
+        edges['lanes'] = np.nan
     else:
-        edges['lanes'] = pd.to_numeric(edges['lanes'], errors='coerce').fillna(2)
+        edges['lanes'] = pd.to_numeric(edges['lanes'], errors='coerce')
         
     if 'turn:lanes' not in edges.columns:
         edges['turn:lanes'] = "none"
@@ -226,6 +293,7 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             'u': row['u'],
             'v': row['v'],
             'osmid': str(row['osmid']),
+            'highway': str(row['highway']),
             'length': float(row['length']),
             'exit_heading': get_smoothed_heading(geom, reverse=False),
             'entry_heading': get_smoothed_heading(geom, reverse=True)
@@ -245,6 +313,7 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
         banned_successors = []
         only_successors = []
         valid_successors = []
+        u_turn_successors = []
         
         only_targets_succ = {}
         for e_id in ego_osmids:
@@ -267,10 +336,23 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             delta_theta = (succ_heading - data['exit_heading'] + 180) % 360 - 180
             
             if -25 <= delta_theta <= 25: direction = 'straight'
-            elif 25 < delta_theta < 155: direction = 'left'
-            elif -155 < delta_theta < -25: direction = 'right'
+            elif 25 < delta_theta < 170: direction = 'left'
+            elif -170 < delta_theta < -25: direction = 'right'
             else: direction = 'u_turn'
             
+            # Apply U-Turn Filters (Undivided Road, Mid-Block, Highway Classification)
+            if direction == 'u_turn':
+                is_same_way = any(e_id in succ_osmids for e_id in ego_osmids)
+                hw_type = segment_data[ego_id]['highway']
+                banned_hw = ['primary', 'secondary', 'trunk', 'motorway', 'primary_link', 'secondary_link', 'trunk_link', 'motorway_link']
+                is_banned_hw = hw_type in banned_hw
+                out_degree = len(potential_successors)
+                in_degree = len(edges_by_v.get(v_node, []))
+                is_mid_block = (out_degree <= 2 and in_degree <= 2)
+                
+                if is_same_way or is_banned_hw or is_mid_block:
+                    continue  # Invalid structural U-turn, ignore entirely
+
             # Check Turn Restrictions
             is_banned = False
             is_only = False
@@ -298,6 +380,9 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
                 banned_successors.append(sid_str)
             else:
                 valid_successors.append(sid_str)
+                if direction == 'u_turn':
+                    u_turn_successors.append(sid_str)
+                    logger.info(f"Ego [{ego_id}]: Valid U-Turn to successor segment {sid_str} detected.")
                 
                 if is_only:
                     only_successors.append(sid_str)
@@ -337,10 +422,23 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             delta_theta = (data['entry_heading'] - pred_heading + 180) % 360 - 180
             
             if -25 <= delta_theta <= 25: direction = 'straight'
-            elif 25 < delta_theta < 155: direction = 'left'
-            elif -155 < delta_theta < -25: direction = 'right'
+            elif 25 < delta_theta < 170: direction = 'left'
+            elif -170 < delta_theta < -25: direction = 'right'
             else: direction = 'u_turn'
             
+            # Apply U-Turn Filters for Predecessors
+            if direction == 'u_turn':
+                is_same_way = any(p_id in ego_osmids for p_id in pred_osmids)
+                hw_type = segment_data[ego_id]['highway']
+                banned_hw = ['primary', 'secondary', 'trunk', 'motorway', 'primary_link', 'secondary_link', 'trunk_link', 'motorway_link']
+                is_banned_hw = hw_type in banned_hw
+                out_degree = len(edges_by_u.get(u_node, []))
+                in_degree = len(potential_predecessors)
+                is_mid_block = (out_degree <= 2 and in_degree <= 2)
+                
+                if is_same_way or is_banned_hw or is_mid_block:
+                    continue  # Invalid structural U-turn, ignore entirely
+
             # Check Turn Restrictions
             is_banned = False
             is_only = False
@@ -390,19 +488,29 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             'predecessor': best_pred,
             'banned_successors': banned_successors,
             'only_successors': only_successors,
-            'valid_successors': valid_successors
+            'valid_successors': valid_successors,
+            'u_turn_successors': u_turn_successors
         }
 
     logger.info(f"Chaining segments to reach {target_dist}m...")
     for ego_id in segment_data.keys():
         # Build Successor Chain
         succ_chain = []
+        merging_into = []
         curr_dist = 0.0
         curr_id = ego_id
         while curr_dist < target_dist:
             next_id = best_immediate[curr_id]['successor']
             if not next_id or next_id in succ_chain or next_id == ego_id:
                 break
+                
+            # Merge check: Only consider it a continuation if we are the preferred predecessor
+            right_of_way_pred = best_immediate[next_id]['predecessor']
+            if right_of_way_pred != curr_id:
+                if curr_id == ego_id:
+                    merging_into.append(next_id)
+                break # We yield right of way, so our topological successor chain ends here
+                
             succ_chain.append(next_id)
             curr_dist += segment_data[next_id]['length']
             curr_id = next_id
@@ -422,7 +530,8 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
         ego_u = segment_data[ego_id]['u']
         ego_v = segment_data[ego_id]['v']
         ego_osmids = parse_osmids(segment_data[ego_id]['osmid'])
-        immediate_succ = best_immediate[ego_id]['successor']
+        immediate_succ = succ_chain[0] if succ_chain else None
+        u_turns = best_immediate[ego_id]['u_turn_successors']
         banned_successors = best_immediate[ego_id]['banned_successors']
         only_successors = best_immediate[ego_id]['only_successors']
         valid_successors = best_immediate[ego_id]['valid_successors']
@@ -434,25 +543,55 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             succ_v = segment_data[immediate_succ]['v']
             succ_opposite = [str(sid) for sid in edges_by_v.get(ego_v, []) if segment_data[str(sid)]['u'] == succ_v]
             
-        filtered_intersects_in = [str(sid) for sid in edges_by_v.get(ego_v, []) if str(sid) != ego_id and str(sid) not in opposite_direction and str(sid) not in succ_opposite]
+        raw_intersects_in = [str(sid) for sid in edges_by_v.get(ego_v, []) if str(sid) != ego_id and str(sid) not in opposite_direction and str(sid) not in succ_opposite]
+        
+        filtered_intersects_in = []
+        if immediate_succ:
+            for sid in raw_intersects_in:
+                s_succ = best_immediate[sid]['successor']
+                s_only = best_immediate[sid]['only_successors']
+                s_valid = best_immediate[sid]['valid_successors']
+                
+                s_u = segment_data[sid]['u']
+                s_v = segment_data[sid]['v']
+                s_opposite = [str(x) for x in edges_by_u.get(s_v, []) if segment_data[str(x)]['v'] == s_u]
+                
+                s_intersects_out = [] if s_only else [str(x) for x in s_valid if str(x) != s_succ and str(x) not in s_opposite]
+                
+                if immediate_succ == s_succ or immediate_succ in s_intersects_out:
+                    filtered_intersects_in.append(sid)
         
         if only_successors:
             filtered_intersects_out = [] # Mandatory transition strips away all other intersection choices.
         else:
-            filtered_intersects_out = [str(sid) for sid in valid_successors if str(sid) != immediate_succ and str(sid) not in opposite_direction]
+            filtered_intersects_out = [str(sid) for sid in valid_successors if str(sid) != immediate_succ and str(sid) not in opposite_direction and str(sid) not in u_turns and str(sid) not in merging_into]
+
+        crosses = []
+        targets = set(filtered_intersects_out + merging_into + u_turns)
+        for b_id in edges_by_v.get(ego_v, []):
+            b_str = str(b_id)
+            if b_str != ego_id and best_immediate[b_str]['successor'] in targets:
+                if b_str not in crosses:
+                    crosses.append(b_str)
 
         adjacency[ego_id] = {
-            'successors': succ_chain,
-            'predecessors': pred_chain,
-            'intersects_in': filtered_intersects_in,
-            'intersects_out': filtered_intersects_out,
+            'to': succ_chain,
+            'from': pred_chain,
+            'merges_into': merging_into,
+            'crossed_by': filtered_intersects_in,
+            'turns_into': filtered_intersects_out,
+            'u_turns_into': u_turns,
+            'crosses': crosses,
             'banned_successors': banned_successors,
             'only_successors': only_successors,
             'opposite_direction': opposite_direction,
-            'successor_lengths': [segment_data[sid]['length'] for sid in succ_chain],
-            'predecessor_lengths': [segment_data[sid]['length'] for sid in pred_chain],
-            'intersects_in_lengths': [segment_data[sid]['length'] for sid in filtered_intersects_in],
-            'intersects_out_lengths': [segment_data[sid]['length'] for sid in filtered_intersects_out],
+            'to_lengths': [segment_data[sid]['length'] for sid in succ_chain],
+            'from_lengths': [segment_data[sid]['length'] for sid in pred_chain],
+            'merges_into_lengths': [segment_data[sid]['length'] for sid in merging_into],
+            'crossed_by_lengths': [segment_data[sid]['length'] for sid in filtered_intersects_in],
+            'turns_into_lengths': [segment_data[sid]['length'] for sid in filtered_intersects_out],
+            'u_turns_into_lengths': [segment_data[sid]['length'] for sid in u_turns],
+            'crosses_lengths': [segment_data[sid]['length'] for sid in crosses],
             'opposite_direction_lengths': [segment_data[sid]['length'] for sid in opposite_direction]
         }
         
@@ -479,8 +618,8 @@ def merge_short_segments(gdf, adj, threshold=15.0):
         s_adj = adj.get(str(s_id))
         if not s_adj: continue
             
-        t_id_original = s_adj['successors'][0] if s_adj.get('successors') else (s_adj['predecessors'][0] if s_adj.get('predecessors') else None)
-        is_succ = bool(s_adj.get('successors'))
+        t_id_original = s_adj['to'][0] if s_adj.get('to') else (s_adj['from'][0] if s_adj.get('from') else None)
+        is_succ = bool(s_adj.get('to'))
             
         if not t_id_original: continue
             

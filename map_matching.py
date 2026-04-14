@@ -18,9 +18,9 @@ from leuvenmapmatching.map.inmem import InMemMap
 
 def get_osm_map(edges_gdf):
     map_con = InMemMap("osm", use_latlon=False, use_rtree=True, index_edges=True)
-    for _, row in edges_gdf.iterrows():
-        u, v = int(row['u']), int(row['v'])
-        coords = list(row['geometry'].coords)
+    for row in edges_gdf.itertuples():
+        u, v = int(row.u), int(row.v)
+        coords = list(row.geometry.coords)
         map_con.add_node(u, (coords[0][0], coords[0][1]))
         map_con.add_node(v, (coords[-1][0], coords[-1][1]))
         map_con.add_edge(u, v)
@@ -73,7 +73,10 @@ def _parse_pneuma_chunk(args):
             for p in sampled_pts:
                 data_list.append([track_id, v_type, traveled_d, avg_speed_ms] + p)
                 
-    return data_list
+    columns = ['track_id', 'type', 'traveled_d', 'avg_speed', 'lat', 'lon', 'speed', 'lon_acc', 'lat_acc', 'time']
+    if not data_list:
+        return pd.DataFrame(columns=columns)
+    return pd.DataFrame(data_list, columns=columns)
 
 def parse_pneuma_to_long(filepath, config, logger, test=False):
     logger.info(f"Parsing {filepath}...")
@@ -122,18 +125,20 @@ def parse_pneuma_to_long(filepath, config, logger, test=False):
             if chunk:
                 yield (chunk, config)
 
-    data_list = []
+    df_list = []
     num_processes = multiprocessing.cpu_count()
     
     # Use imap_unordered to process chunks as they are generated and yielded
     with multiprocessing.Pool(processes=num_processes) as pool:
-        for result in pool.imap_unordered(_parse_pneuma_chunk, chunk_generator()):
-            data_list.extend(result)
+        for result_df in pool.imap_unordered(_parse_pneuma_chunk, chunk_generator()):
+            if not result_df.empty:
+                df_list.append(result_df)
 
-    df = pd.DataFrame(data_list, columns=[
-        'track_id', 'type', 'traveled_d', 'avg_speed', 
-        'lat', 'lon', 'speed', 'lon_acc', 'lat_acc', 'time'
-    ])
+    if df_list:
+        df = pd.concat(df_list, ignore_index=True)
+    else:
+        columns = ['track_id', 'type', 'traveled_d', 'avg_speed', 'lat', 'lon', 'speed', 'lon_acc', 'lat_acc', 'time']
+        df = pd.DataFrame(columns=columns)
     
     logger.info(f"Parsing took {time.time() - start_time:.2f} seconds. Parsed {len(df)} points.")
     return df
@@ -159,14 +164,20 @@ def _map_match_worker_init(gpkg_path, config):
     global_len_map = {}
     global_uv_to_seg = {}
     global_hw_map = {}
-    for _, row in edges_gdf.iterrows():
-        key = (int(row['u']), int(row['v']))
-        global_lanes_map[key] = int(row['lanes'])
-        global_len_map[key] = float(row['length'])
-        global_uv_to_seg[key] = str(row['segment_id'])
-        global_hw_map[key] = str(row['highway'])
+    for row in edges_gdf.itertuples():
+        key = (int(row.u), int(row.v))
+        try:
+            if pd.isna(row.lanes):
+                global_lanes_map[key] = 2
+            else:
+                global_lanes_map[key] = int(row.lanes)
+        except Exception:
+            global_lanes_map[key] = 2
+        global_len_map[key] = float(row.length)
+        global_uv_to_seg[key] = str(row.segment_id)
+        global_hw_map[key] = str(row.highway)
         
-        coords = np.array(row['geometry'].coords)
+        coords = np.array(row.geometry.coords)
         if len(coords) < 2:
             continue
             
@@ -610,9 +621,9 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir, config, logger):
     default_speeds = config["default_speeds"]
     
     empirical_speeds = {}
-    for _, row in edges_gdf.iterrows():
-        seg_id = str(row['segment_id'])
-        hw = row['highway']
+    for row in edges_gdf.itertuples():
+        seg_id = str(row.segment_id)
+        hw = row.highway
         if seg_id in speeds:
             empirical_speeds[seg_id] = speeds[seg_id]
         else:
@@ -723,7 +734,7 @@ def main():
     config = {
         "sampling_interval": 1000,
         "test_percentage": 0.05,
-        "debug_segments": ["1750", "1909", "1751", "1756", "1753","1760", "1834", "2227", "1836","208","220"],
+        "debug_segments": [],
         "removed_segments": removed_segments_list,
         "segment_lanes": segment_lanes_dict,
         "segment_boundaries": segment_boundaries_dict,
@@ -774,7 +785,7 @@ def main():
         return
         
     global_logger.info("Loading OSM network...")
-    network_path = 'osm_network_merged.gpkg'
+    network_path = 'osm_network.gpkg'
     edges_gdf = gpd.read_file(network_path)
     
     all_detected_lanes = {}
@@ -787,17 +798,20 @@ def main():
                 all_detected_lanes[seg_id].append(count)
 
     osm_lanes = {}
-    for _, row in edges_gdf.iterrows():
-        seg_id = str(row['segment_id'])
+    for row in edges_gdf.itertuples():
+        seg_id = str(row.segment_id)
         try:
-            lanes = int(row['lanes'])
+            if pd.isna(row.lanes):
+                lanes = None
+            else:
+                lanes = int(row.lanes)
         except (ValueError, TypeError):
-            lanes = 2
+            lanes = None
         osm_lanes[seg_id] = lanes
         
     average_detected_lanes = {}
     for seg_id, counts in all_detected_lanes.items():
-        average_detected_lanes[seg_id] = sum(counts) / len(counts)
+        average_detected_lanes[seg_id] = round(sum(counts) / len(counts))
         
     avg_lanes_file = os.path.join("processed_data", "average_detected_lanes.json")
     with open(avg_lanes_file, "w") as f:
@@ -808,9 +822,9 @@ def main():
     mismatches_found = 0
     with open(mismatch_log_file, "w") as f:
         for seg_id, avg_lanes in average_detected_lanes.items():
-            osm_count = osm_lanes.get(seg_id, 2)
+            osm_count = osm_lanes.get(seg_id)
             if avg_lanes != osm_count:
-                f.write(f"Segment {seg_id}: Average Detected = {avg_lanes:.2f}, OSM Defined = {osm_count}\n")
+                f.write(f"Segment {seg_id}: Average Detected = {avg_lanes}, OSM Defined = {osm_count}\n")
                 mismatches_found += 1
                 
     global_logger.info(f"Found {mismatches_found} segments with lane mismatches. See {mismatch_log_file}")

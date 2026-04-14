@@ -64,10 +64,10 @@ def process_frenet_continuous_chunk(chunk_data_tuple):
                     n_df = bg_df.iloc[best_indices]
                     
                     ego_adj = adjacency.get(ego_seg, {})
-                    successors = ego_adj.get('successors', [])
-                    predecessors = ego_adj.get('predecessors', [])
-                    successor_lengths = ego_adj.get('successor_lengths', [])
-                    predecessor_lengths = ego_adj.get('predecessor_lengths', [])
+                    successors = ego_adj.get('to', [])
+                    predecessors = ego_adj.get('from', [])
+                    successor_lengths = ego_adj.get('to_lengths', [])
+                    predecessor_lengths = ego_adj.get('from_lengths', [])
                     
                     for _, n_row in n_df.iterrows():
                         n_seg = n_row['segment_id']
