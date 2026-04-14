@@ -4,8 +4,12 @@
 *.pyc   
 *.html
 /pNEUMA_dataset
+/previous_network
 *.pdf
 *.md
 *.csv
 *.gpkg
 *.json
+/prompts
+extract_map_and_speeds.py
+*.log

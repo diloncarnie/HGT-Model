@@ -255,7 +255,7 @@ def process_track(track_data, config):
 
 def process_file(csv_path, config):
     out_dir = Path(csv_path).parent
-    log_path = out_dir / 'extraction.log'
+    log_path = out_dir / 'traversal-metrics.log'
     
     # Setup standard python logging
     logger = logging.getLogger(f"extraction_{csv_path}")
@@ -519,6 +519,20 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    global_logger = logging.getLogger("global_traversal_metrics")
+    global_logger.setLevel(logging.INFO)
+    if global_logger.hasHandlers():
+        global_logger.handlers.clear()
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('%(message)s'))
+    global_logger.addHandler(ch)
+    
+    if args.folder:
+        global_log_path = Path(args.folder) / 'global-traversal-metrics.log'
+        fh = logging.FileHandler(global_log_path, mode='w', encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(message)s'))
+        global_logger.addHandler(fh)
+    
     config = {
         "gap_threshold": 30.0,
         "min_edge_threshold": 8.0,
@@ -593,28 +607,28 @@ if __name__ == "__main__":
                                 low_volume_segments_tracker[seg] = []
                             low_volume_segments_tracker[seg].append(target_path.parent.name)
     else:
-        print("Please provide either --file or --folder")
+        global_logger.info("Please provide either --file or --folder")
         
     if len(max_red_light_durations) > 1:
         avg_max_red_light = sum(max_red_light_durations) / len(max_red_light_durations)
-        print(f"Average of max red light durations across {len(max_red_light_durations)} files: {avg_max_red_light:.2f}s")
+        global_logger.info(f"Average of max red light durations across {len(max_red_light_durations)} files: {avg_max_red_light:.2f}s")
         
     if len(file_avg_ratios) > 0:
         overall_avg_ratio = sum(file_avg_ratios) / len(file_avg_ratios)
         overall_avg_stop = sum(file_avg_stops) / len(file_avg_stops)
-        print(f"Average of outlier proportions across {len(file_avg_ratios)} files: {overall_avg_ratio:.2%}")
-        print(f"Average of outlier stop durations across {len(file_avg_stops)} files: {overall_avg_stop:.2f}s")
+        global_logger.info(f"Average of outlier proportions across {len(file_avg_ratios)} files: {overall_avg_ratio:.2%}")
+        global_logger.info(f"Average of outlier stop durations across {len(file_avg_stops)} files: {overall_avg_stop:.2f}s")
         
     if invalid_segments_tracker:
-        print("\n--- Invalid Segments Across Files ---")
+        global_logger.info("\n--- Invalid Segments Across Files ---")
         for seg, files in sorted(invalid_segments_tracker.items(), key=lambda x: len(x[1]), reverse=True):
-            print(f"Segment {seg} was invalid in {len(files)} files:")
+            global_logger.info(f"Segment {seg} was invalid in {len(files)} files:")
             for f in files:
-                print(f"  - {f}")
+                global_logger.info(f"  - {f}")
                 
     if low_volume_segments_tracker:
-        print("\n--- Low Volume Segments (< 10 Valid Traversals) ---")
+        global_logger.info("\n--- Low Volume Segments (< 10 Valid Traversals) ---")
         for seg, files in sorted(low_volume_segments_tracker.items(), key=lambda x: len(x[1]), reverse=True):
-            print(f"Segment {seg} had < 10 valid traversals in {len(files)} files:")
+            global_logger.info(f"Segment {seg} had < 10 valid traversals in {len(files)} files:")
             for f in files:
-                print(f"  - {f}")
+                global_logger.info(f"  - {f}")

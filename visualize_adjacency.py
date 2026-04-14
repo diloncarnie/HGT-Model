@@ -56,7 +56,7 @@ def visualize_adjacency(network_file, adjacency_file):
 
     print("Generating base map...")
     # Calculate rightward perpendicular shift to separate perfectly overlapping opposite-direction segments
-    SHIFT_OFFSET = 0.00003 # ~3 meters offset
+    SHIFT_OFFSET = 0.00002 # ~3 meters offset
     
     lats = []
     lons = []
