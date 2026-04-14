@@ -246,13 +246,18 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
         only_successors = []
         valid_successors = []
         
-        only_targets_succ = set()
+        only_targets_succ = {}
         for e_id in ego_osmids:
             for (f_id, t_id, rtype) in only_transitions:
                 if f_id == e_id:
-                    only_targets_succ.add(t_id)
+                    only_targets_succ[t_id] = rtype
                     
         potential_successors = edges_by_u.get(v_node, [])
+        
+        target_sids = [str(p) for p in potential_successors if any(tid in parse_osmids(segment_data[str(p)]['osmid']) for tid in only_targets_succ.keys())]
+        if not target_sids:
+            only_targets_succ = {}
+            
         for succ_id in potential_successors:
             sid_str = str(succ_id)
             if sid_str == ego_id: continue
@@ -273,10 +278,12 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             if only_targets_succ:
                 if any(s_id in only_targets_succ for s_id in succ_osmids):
                     is_only = True
-                    logger.info(f"Ego [{ego_id}]: Mandatory {direction} transition to {sid_str} confirmed.")
+                    matched_rtypes = [only_targets_succ[s_id] for s_id in succ_osmids if s_id in only_targets_succ]
+                    logger.info(f"Ego [{ego_id}]: Mandatory {direction} transition to segment {sid_str} confirmed ({matched_rtypes[0]}).")
                 else:
                     is_banned = True
-                    logger.info(f"Ego [{ego_id}]: Connection to {sid_str} filtered out (Only restriction points elsewhere).")
+                    rtypes = list(set(only_targets_succ.values()))
+                    logger.info(f"Ego [{ego_id}] ({ego_osmids}) : Connection to segment {sid_str} filtered out (Only restriction {rtypes} points to segment(s) {target_sids}).")
                     
             if not is_banned and not is_only:
                 for e_id in ego_osmids:
@@ -285,7 +292,7 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
                             if f_id == e_id and t_id == s_id:
                                 if direction in rtype:
                                     is_banned = True
-                                    logger.info(f"Ego [{ego_id}] ({ego_osmids}): Connection to {sid_str} removed by spatial filter ({rtype} explicitly matched {direction}).")
+                                    logger.info(f"Ego [{ego_id}] ({e_id}): Banned connection to segment {sid_str} removed by spatial filter ({rtype} explicitly matched {direction}).")
                                     
             if is_banned:
                 banned_successors.append(sid_str)
@@ -316,7 +323,9 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             for po_id in p_osmids:
                 for (f_id, t_id, rtype) in only_transitions:
                     if f_id == po_id:
-                        only_targets_pred.setdefault(p_id, set()).add(t_id)
+                        if p_id not in only_targets_pred:
+                            only_targets_pred[p_id] = {}
+                        only_targets_pred[p_id][t_id] = rtype
                         
         potential_predecessors = edges_by_v.get(u_node, [])
         for pred_id in potential_predecessors:
@@ -336,12 +345,21 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             is_banned = False
             is_only = False
             
-            targets = only_targets_pred.get(sid_str, set())
+            targets = only_targets_pred.get(sid_str, {})
+            if targets:
+                target_sids_pred = [str(p) for p in edges_by_u.get(u_node, []) if any(tid in parse_osmids(segment_data[str(p)]['osmid']) for tid in targets.keys())]
+                if not target_sids_pred:
+                    targets = {}
+                    
             if targets:
                 if any(e_id in targets for e_id in ego_osmids):
                     is_only = True
+                    matched_rtypes = [targets[e_id] for e_id in ego_osmids if e_id in targets]
+                    logger.info(f"Ego [{ego_id}]: Mandatory transition from predecessor segment {sid_str} confirmed ({matched_rtypes[0]}).")
                 else:
                     is_banned = True
+                    rtypes = list(set(targets.values()))
+                    logger.info(f"Ego [{ego_id}] ({ego_osmids}): Predecessor segment {sid_str} filtered out (Only restriction {rtypes} points to segment(s) {target_sids_pred}).")
                     
             if not is_banned and not is_only:
                 for p_id in pred_osmids:
@@ -350,7 +368,7 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
                             if f_id == p_id and t_id == e_id:
                                 if direction in rtype:
                                     is_banned = True
-                                    logger.info(f"Ego [{ego_id}] ({ego_osmids}): Predecessor {sid_str} removed by spatial filter ({rtype} matches {direction}).")
+                                    logger.info(f"Ego [{ego_id}] ({ego_osmids}): Banned connection from predecessor segment {sid_str} removed by spatial filter ({rtype} explicitly matched {direction}).")
                                     
             if is_banned:
                 continue
@@ -498,7 +516,7 @@ def merge_short_segments(gdf, adj, threshold=15.0):
 
 def main():
     parser = argparse.ArgumentParser(description="Build robust topological adjacency. Always downloads the latest network.")
-    parser.add_argument('--output', default='topological_adjacency_test.json', help="Output JSON filename.")
+    parser.add_argument('--output', default='topological_adjacency.json', help="Output JSON filename.")
     args = parser.parse_args()
     
     # Always download the network as requested
@@ -511,7 +529,7 @@ def main():
     # # 3. Rebuild final clean adjacency
     # adjacency = build_topological_adjacency(edges)
     
-    network_path = "osm_network_test.gpkg"
+    network_path = "osm_network.gpkg"
     logger.info(f"Saving final merged OSM network to {network_path}...")
     
     # GPKG cannot handle lists well. Convert any list-like osmid or highway tags to simple strings for saving.
