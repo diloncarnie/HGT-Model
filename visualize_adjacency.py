@@ -5,8 +5,17 @@ import plotly.graph_objects as go
 import geopandas as gpd
 import os
 import json
+import numpy as np
 
 def visualize_adjacency(network_file, adjacency_file):
+    if not os.path.exists(network_file):
+        print(f"Error: Network file '{network_file}' not found.")
+        return
+        
+    if not os.path.exists(adjacency_file):
+        print(f"Error: Adjacency file '{adjacency_file}' not found.")
+        return
+
     print(f"Loading data...")
     edges = gpd.read_file(network_file)
     if edges.crs != "EPSG:4326":
@@ -19,21 +28,90 @@ def visualize_adjacency(network_file, adjacency_file):
     
     # Add adjacency info to edges for hover
     def get_adj_summary(sid, key):
-        chain = adjacency.get(str(sid), {}).get(key, [])
-        lengths = adjacency.get(str(sid), {}).get(f"{key[:-1]}_lengths", [])
+        node_data = adjacency.get(str(sid), {})
+        chain = node_data.get(key, [])
         if not chain:
             return "None"
-        total_len = sum(lengths)
-        return f"{len(chain)} segments ({total_len:.1f}m): {chain}"
+        length_key = f"{key[:-1]}_lengths" if key.endswith('s') else f"{key}_lengths"
+        lengths = node_data.get(length_key, [])
+        if lengths and len(lengths) == len(chain):
+            total_len = sum(lengths)
+            return f"{len(chain)} segments ({total_len:.1f}m): {chain}"
+        return f"{len(chain)} segments: {chain}"
 
     edges['successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'successors'))
     edges['predecessors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'predecessors'))
+    edges['intersects_in_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'intersects_in'))
+    edges['intersects_out_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'intersects_out'))
+    edges['opposite_direction_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'opposite_direction'))
+    edges['banned_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'banned_successors'))
+    edges['only_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'only_successors'))
+    
+    # Ensure turn information columns exist before adding them to hover data
+    for col in ['turn:lanes', 'turn']:
+        if col not in edges.columns:
+            edges[col] = "None"
+        else:
+            edges[col] = edges[col].fillna("None").astype(str)
 
     print("Generating base map...")
-    # Hack: use scatter_map on the centroids for easy clicking
-    edges['centroid'] = edges.geometry.centroid
-    edges['lat'] = edges['centroid'].y
-    edges['lon'] = edges['centroid'].x
+    # Calculate rightward perpendicular shift to separate perfectly overlapping opposite-direction segments
+    SHIFT_OFFSET = 0.00003 # ~3 meters offset
+    
+    lats = []
+    lons = []
+    geo_map = {}
+    
+    for idx, row in edges.iterrows():
+        geom = row.geometry
+        
+        # Calculate overall direction vector of the segment
+        if geom.geom_type == 'LineString':
+            coords = list(geom.coords)
+        elif geom.geom_type == 'MultiLineString':
+            coords = list(geom.geoms[0].coords)
+        else:
+            coords = []
+            
+        if len(coords) >= 2:
+            dx = coords[-1][0] - coords[0][0]
+            dy = coords[-1][1] - coords[0][1]
+            length = np.hypot(dx, dy)
+            if length > 0:
+                nx = dy / length
+                ny = -dx / length
+            else:
+                nx, ny = 0.0, 0.0
+        else:
+            nx, ny = 0.0, 0.0
+            
+        # Check if the segment is a one-way street
+        is_oneway = str(row.get('oneway', 'False')).lower() in ['true', 'yes', '1']
+        
+        if is_oneway:
+            shift_lon = 0.0
+            shift_lat = 0.0
+        else:
+            shift_lon = nx * SHIFT_OFFSET
+            shift_lat = ny * SHIFT_OFFSET
+        
+        centroid = geom.centroid
+        lats.append(centroid.y + shift_lat)
+        lons.append(centroid.x + shift_lon)
+        
+        # Shift the visualized geometry rightward as well for the frontend geo_map
+        shifted_coords = []
+        if geom.geom_type == 'LineString':
+            shifted_coords = [[y + shift_lat, x + shift_lon] for x, y in zip(*geom.xy)]
+        elif geom.geom_type == 'MultiLineString':
+            for line in geom.geoms:
+                shifted_coords.extend([[y + shift_lat, x + shift_lon] for x, y in zip(*line.xy)])
+                shifted_coords.append([None, None])
+                
+        geo_map[row['segment_id_str']] = shifted_coords
+
+    edges['lat'] = lats
+    edges['lon'] = lons
 
     fig = px.scatter_map(
         edges,
@@ -44,8 +122,16 @@ def visualize_adjacency(network_file, adjacency_file):
             "segment_id": True,
             "length": True,
             "highway": True,
+            "oneway": True,
+            "turn:lanes": True,
+            "turn": True,
             "successors_info": True,
             "predecessors_info": True,
+            "intersects_in_info": True,
+            "intersects_out_info": True,
+            "banned_successors_info": True,
+            "only_successors_info": True,
+            "opposite_direction_info": True,
             "lat": False,
             "lon": False
         },
@@ -57,16 +143,12 @@ def visualize_adjacency(network_file, adjacency_file):
     # Add ALL road lines as a faint background layer
     lats = []
     lons = []
-    for geom in edges.geometry:
-        if geom.geom_type == 'LineString':
-            x, y = geom.xy
-            lats.extend(list(y) + [None])
-            lons.extend(list(x) + [None])
-        elif geom.geom_type == 'MultiLineString':
-            for line in geom.geoms:
-                x, y = line.xy
-                lats.extend(list(y) + [None])
-                lons.extend(list(x) + [None])
+    for coords in geo_map.values():
+        for pt in coords:
+            lats.append(pt[0])
+            lons.append(pt[1])
+        lats.append(None)
+        lons.append(None)
     
     bg_roads = go.Scattermap(
         lat=lats,
@@ -83,19 +165,6 @@ def visualize_adjacency(network_file, adjacency_file):
     fig.data = (data_list[1], data_list[0])
 
     print("Preparing interactive HTML...")
-    
-    # Map of segment_id -> coords for JS
-    geo_map = {}
-    for _, row in edges.iterrows():
-        coords = []
-        if row.geometry.geom_type == 'LineString':
-            coords = [[y, x] for x, y in zip(*row.geometry.xy)]
-        elif row.geometry.geom_type == 'MultiLineString':
-            # Simplified for highlighting: just take first part or flatten
-            for line in row.geometry.geoms:
-                coords.extend([[y, x] for x, y in zip(*line.xy)])
-                coords.append([None, None])
-        geo_map[row['segment_id_str']] = coords
 
     html_file = "adjacency_debugger.html"
     base_html = fig.to_html(include_plotlyjs="cdn", full_html=True)
@@ -158,20 +227,47 @@ def visualize_adjacency(network_file, adjacency_file):
 
         function highlightNeighbors(egoId, plotEl) {{
             var egoIdStr = String(egoId);
-            var adj = adjacency[egoIdStr] || {{successors: [], predecessors: []}};
+            var adj = adjacency[egoIdStr] || {{successors: [], predecessors: [], intersects_in: [], intersects_out: [], opposite_direction: [], banned_successors: [], only_successors: []}};
             
             var traces = [];
             
             // 1. Ego (Gold)
             if (geoMap[egoIdStr]) {{
+                var coords = geoMap[egoIdStr];
                 traces.push({{
                     type: 'scattermap',
-                    lat: geoMap[egoIdStr].map(p => p[0]),
-                    lon: geoMap[egoIdStr].map(p => p[1]),
+                    lat: coords.map(p => p[0]),
+                    lon: coords.map(p => p[1]),
                     mode: 'lines',
                     line: {{width: 8, color: 'gold'}},
                     name: 'Selected: ' + egoIdStr
                 }});
+                
+                // Find the first valid point to mark as START
+                var firstValid = null;
+                for (var i = 0; i < coords.length; i++) {{
+                    if (coords[i][0] !== null) {{ firstValid = coords[i]; break; }}
+                }}
+                
+                // Find the last valid point to mark as END
+                var lastValid = null;
+                for (var i = coords.length - 1; i >= 0; i--) {{
+                    if (coords[i][0] !== null) {{ lastValid = coords[i]; break; }}
+                }}
+                
+                if (firstValid && lastValid) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: [firstValid[0], lastValid[0]],
+                        lon: [firstValid[1], lastValid[1]],
+                        mode: 'markers+text',
+                        marker: {{size: [10, 14], color: ['white', 'black']}},
+                        text: ['START', 'END'],
+                        textposition: 'top center',
+                        textfont: {{size: 14, color: 'black'}},
+                        name: 'Direction'
+                    }});
+                }}
             }}
             
             // 2. Successors (Green)
@@ -198,6 +294,77 @@ def visualize_adjacency(network_file, adjacency_file):
                         mode: 'lines',
                         line: {{width: 6, color: 'red'}},
                         name: 'Predecessor: ' + sid
+                    }});
+                }}
+            }});
+
+            // 4. Intersects In (Cyan) - Segments flowing INTO the ego segment intersection
+            (adj.intersects_in || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 5, color: 'cyan'}},
+                        name: 'Intersects (In): ' + sid
+                    }});
+                }}
+            }});
+
+            // 5. Intersects Out (Magenta) - Segments flowing OUT OF the ego segment intersection
+            (adj.intersects_out || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 5, color: 'magenta'}},
+                        name: 'Intersects (Out): ' + sid
+                    }});
+                }}
+            }});
+
+            // 6. Opposite Direction (Purple) - Overlapping opposite segment
+            (adj.opposite_direction || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 5, color: 'purple'}},
+                        name: 'Opposite Dir: ' + sid,
+                        visible: 'legendonly' // Hides it on the map, keeps it in the legend!
+                    }});
+                }}
+            }});
+
+            // 7. Banned Successors (Black)
+            (adj.banned_successors || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 4, color: 'black'}},
+                        name: 'Banned Turn: ' + sid
+                    }});
+                }}
+            }});
+
+            // 8. Only Successors (Blue)
+            (adj.only_successors || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 6, color: 'blue'}},
+                        name: 'Mandatory Turn: ' + sid
                     }});
                 }}
             }});
