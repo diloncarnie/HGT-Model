@@ -4,6 +4,7 @@ import os
 import shutil
 import json
 import multiprocessing
+import logging
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -74,8 +75,8 @@ def _parse_pneuma_chunk(args):
                 
     return data_list
 
-def parse_pneuma_to_long(filepath, config, test=False):
-    print(f"Parsing {filepath}...")
+def parse_pneuma_to_long(filepath, config, logger, test=False):
+    logger.info(f"Parsing {filepath}...")
     start_time = time.time()
     
     if test:
@@ -95,7 +96,7 @@ def parse_pneuma_to_long(filepath, config, test=False):
                     num_vehicles += 1
                     
         limit = max(1, int(num_vehicles * config["test_percentage"]))
-        print(f"Test mode: taking {config['test_percentage']*100:.1f}% of non-motorcycle vehicles ({limit} out of {num_vehicles})")
+        logger.info(f"Test mode: taking {config['test_percentage']*100:.1f}% of non-motorcycle vehicles ({limit} out of {num_vehicles})")
     else:
         limit = float('inf')
 
@@ -134,7 +135,7 @@ def parse_pneuma_to_long(filepath, config, test=False):
         'lat', 'lon', 'speed', 'lon_acc', 'lat_acc', 'time'
     ])
     
-    print(f"Parsing took {time.time() - start_time:.2f} seconds. Parsed {len(df)} points.")
+    logger.info(f"Parsing took {time.time() - start_time:.2f} seconds. Parsed {len(df)} points.")
     return df
 
 # Global variables for worker processes to prevent repeated memory allocation
@@ -313,8 +314,8 @@ def _map_match_track(track_tuple):
     valid_traversals = group_results.groupby('segment_id').filter(is_fully_traversed)
     return valid_traversals
 
-def perform_map_matching(df, crs, gpkg_path, config):
-    print("Performing map matching and distance calculation with pool load balancing...")
+def perform_map_matching(df, crs, gpkg_path, config, logger):
+    logger.info("Performing map matching and distance calculation with pool load balancing...")
     start_time = time.time()
     
     # Project to CRS
@@ -333,19 +334,19 @@ def perform_map_matching(df, crs, gpkg_path, config):
                 results.append(res)
     
     final_df = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
-    print(f"Map matching and distance calculation took {time.time() - start_time:.2f} seconds. Matched {len(final_df)} points.")
+    logger.info(f"Map matching and distance calculation took {time.time() - start_time:.2f} seconds. Matched {len(final_df)} points.")
     return final_df
 
-def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=False):
+def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logger, test=False):
     if test:
-        print("Performing Jenks Optimization...")
+        logger.info("Performing Jenks Optimization...")
     start_time = time.time()
 
     # Calculate and print max samples
     if test:
         counts = df[df['segment_id'] != ""]['segment_id'].value_counts()
         if not counts.empty:
-            print(f"Maximum samples in a single segment: {counts.max()}")
+            logger.info(f"Maximum samples in a single segment: {counts.max()}")
 
     # Process Jenks
     lane_boundaries = {}
@@ -358,9 +359,16 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
         if seg_id == "": continue
 
         d_vals = group['signed_dist'].values
-        # Use 98th and 2nd percentiles for robust road width estimation
-        abs_max_d = np.percentile(d_vals, 98)
-        abs_min_d = np.percentile(d_vals, 2)
+        
+        # Determine percentiles for robust road width estimation (default 2 and 98)
+        lower_p, upper_p = 2, 98
+        if seg_id in config.get("segment_boundaries", {}):
+            custom_p = config["segment_boundaries"][seg_id]
+            if isinstance(custom_p, list) and len(custom_p) == 2:
+                lower_p, upper_p = custom_p[0], custom_p[1]
+                
+        abs_max_d = np.percentile(d_vals, upper_p)
+        abs_min_d = np.percentile(d_vals, lower_p)
         road_width = abs_max_d - abs_min_d
 
         # D = Right_Edge - Vehicle_Distance. Clip extreme outliers on both sides.
@@ -377,13 +385,13 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                 if mask.sum() >= config["jenks_min_points"]:
                     hq_D_final = D_vals[mask.values]
                     if test:
-                        print(f"Segment {seg_id}: Retained {len(hq_D_final)} points using speed > {s_thresh}")
+                        logger.info(f"Segment {seg_id}: Retained {len(hq_D_final)} points using speed > {s_thresh}")
                     break
             
             if hq_D_final is None:
                 hq_D_final = D_vals
                 if test:
-                    print(f"Segment {seg_id}: Defaulting to original distribution")
+                    logger.info(f"Segment {seg_id}: Defaulting to original distribution")
 
             # Use raw min/max instead of percentiles
             road_min, road_max = hq_D_final.min(), hq_D_final.max()
@@ -408,22 +416,22 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
             initial_k = max(1, round(max_distance / avg_lane_width))
 
             best_breaks = None
-            if seg_id in config["fixed_segments"]:
-                k = config["fixed_segments"][seg_id]
+            if seg_id in config["segment_lanes"]:
+                k = config["segment_lanes"][seg_id]
                 if k == 1:
                     best_breaks = [road_min, road_max]
                     if test:
-                        print(f"Segment {seg_id}: Manual override applied. Assigned 1 lane [road_min, road_max].")
+                        logger.info(f"Segment {seg_id}: Manual override applied. Assigned 1 lane [road_min, road_max].")
                 else:
                     try:
                         best_breaks = jenkspy.jenks_breaks(sample, n_classes=k)
                         if test:
-                            print(f"Segment {seg_id}: Manual override applied. Assigned {k} lanes using Jenks.")
+                            logger.info(f"Segment {seg_id}: Manual override applied. Assigned {k} lanes using Jenks.")
                     except ValueError:
                         best_breaks = [road_min + i * (max_distance / k) for i in range(k + 1)]
                         failed_segments.append(seg_id)
                         if test:
-                            print(f"Segment {seg_id}: Manual override applied. Jenks failed, using equal widths for {k} lanes.")
+                            logger.info(f"Segment {seg_id}: Manual override applied. Jenks failed, using equal widths for {k} lanes.")
             elif initial_k == 1:
                 # Informed decision for 1 lane: Try Jenks for 2 or 3 lanes.
                 for k in [2, 3]:
@@ -438,7 +446,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                         if valid:
                             best_breaks = breaks
                             if test:
-                                print(f"Segment {seg_id}: Increased 1-lane guess to {k} lanes based on Jenks.")
+                                logger.info(f"Segment {seg_id}: Increased 1-lane guess to {k} lanes based on Jenks.")
                             break
                     except ValueError:
                         continue
@@ -447,7 +455,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                 if best_breaks is None:
                     best_breaks = [road_min, road_max]
                     if test:
-                        print(f"Segment {seg_id}: Defaulted to 1 lane [road_min, road_max].")
+                        logger.info(f"Segment {seg_id}: Defaulted to 1 lane [road_min, road_max].")
             else:
                 k = initial_k
                 max_k = initial_k + 2  # Allow up to 2 more lanes than initial guess if needed
@@ -465,7 +473,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                         if valid:
                             best_breaks = breaks
                             if test:
-                                print(f"Segment {seg_id}: Determined {k} lanes (Initial guess: {initial_k}).")
+                                logger.info(f"Segment {seg_id}: Determined {k} lanes (Initial guess: {initial_k}).")
                             break
                         else:
                             k += 1 # Keep partitioning into more lanes
@@ -487,7 +495,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                             if valid:
                                 best_breaks = breaks
                                 if test:
-                                    print(f"Segment {seg_id}: Reduced to {k_red} lanes (Initial guess: {initial_k}).")
+                                    logger.info(f"Segment {seg_id}: Reduced to {k_red} lanes (Initial guess: {initial_k}).")
                                 break
                         except ValueError:
                             continue
@@ -502,15 +510,15 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                     jenks_segments_used.append(seg_id)
                     failed_segments.append(seg_id)
                     if test:
-                        print(f"Segment {seg_id}: Jenks failed to find valid breaks. Used initial guess with {initial_k} lanes.")
+                        logger.info(f"Segment {seg_id}: Jenks failed to find valid breaks. Used initial guess with {initial_k} lanes.")
                 except ValueError:
                     lane_boundaries[seg_id] = [road_min + i * avg_lane_width for i in range(initial_k + 1)]
         else:
-            if seg_id in config["fixed_segments"]:
-                num_lanes_fixed = config["fixed_segments"][seg_id]
+            if seg_id in config["segment_lanes"]:
+                num_lanes_fixed = config["segment_lanes"][seg_id]
                 lane_boundaries[seg_id] = [i * config["avg_lane_width"] for i in range(num_lanes_fixed + 1)]
                 if test:
-                    print(f"Segment {seg_id}: Manual override applied. Assigned {num_lanes_fixed} lanes (low sample fallback).")
+                    logger.info(f"Segment {seg_id}: Manual override applied. Assigned {num_lanes_fixed} lanes (low sample fallback).")
             else:
                 lane_boundaries[seg_id] = [i * config["avg_lane_width"] for i in range(num_lanes_osm + 1)]
 
@@ -519,6 +527,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
     df['is_outlier'] = False
     
     lanes_updated_count = 0
+    detected_lanes = {}
     for seg_id, bounds in lane_boundaries.items():
         mask = df['segment_id'] == seg_id
         if not mask.any(): continue
@@ -535,20 +544,21 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
         # Update num_lanes to match the number of detected Jenks lanes (or the original OSM lanes if Jenks wasn't used)
         old_lanes = df.loc[mask, 'num_lanes'].iloc[0]
         new_lanes = len(bounds) - 1
+        detected_lanes[seg_id] = new_lanes
         if old_lanes != new_lanes:
             lanes_updated_count += 1
             
         df.loc[mask, 'num_lanes'] = new_lanes
 
     if lanes_updated_count > 0:
-        print(f"Successfully updated 'num_lanes' on {lanes_updated_count} segments using empirical Jenks data.")
+        logger.info(f"Successfully updated 'num_lanes' on {lanes_updated_count} segments using empirical Jenks data.")
     else:
-        print("No segments had their 'num_lanes' altered from the OSM default (likely due to low sample size or Jenks agreeing with OSM).")
+        logger.info("No segments had their 'num_lanes' altered from the OSM default (likely due to low sample size or Jenks agreeing with OSM).")
 
     flagged_outliers = df['is_outlier'].sum()
-    print(f"Flagged {flagged_outliers} outlier trajectory points that did not fit into edge lanes.")
+    logger.info(f"Flagged {flagged_outliers} outlier trajectory points that did not fit into edge lanes.")
 
-    print(f"Jenks Optimization took {time.time() - start_time:.2f} seconds.")
+    logger.info(f"Jenks Optimization took {time.time() - start_time:.2f} seconds.")
 
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, 'lane_boundaries.json'), 'w') as f:
@@ -561,7 +571,7 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
     os.makedirs(failed_dir, exist_ok=True)
     
     segments_to_plot = set(config["debug_segments"]).union(set(failed_segments))
-    print(f"Number of failed segments to plot: {len(failed_segments)}.")
+    logger.info(f"Number of failed segments to plot: {len(failed_segments)}.")
     
     for seg in segments_to_plot:
         if seg in lane_boundaries:
@@ -583,12 +593,11 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=
                 
             plt.savefig(save_path)
             plt.close()
-            print(f"Generated debug histogram for segment {seg}.")
         
-    return df
+    return df, detected_lanes
 
-def calculate_empirical_speeds(df, edges_gdf, output_dir, config):
-    print("Calculating empirical speeds...")
+def calculate_empirical_speeds(df, edges_gdf, output_dir, config, logger):
+    logger.info("Calculating empirical speeds...")
     start_time = time.time()
     
     speed_df = df
@@ -612,35 +621,12 @@ def calculate_empirical_speeds(df, edges_gdf, output_dir, config):
     with open(os.path.join(output_dir, 'empirical_free_flow_speeds.json'), 'w') as f:
         json.dump(empirical_speeds, f, indent=4)
         
-    print(f"Speed calculation took {time.time() - start_time:.2f} seconds.")
+    logger.info(f"Speed calculation took {time.time() - start_time:.2f} seconds.")
     return empirical_speeds
 
-def process_single_file(input_file, edges_gdf, network_path, args, config):
-    print(f"\n--- Processing {input_file} ---")
+def process_single_file(input_file, edges_gdf, network_path, args, config, global_logger):
     file_start_time = time.time()
     
-    df = parse_pneuma_to_long(input_file, config, test=args.test)
-    if df.empty:
-        print("No data parsed.")
-        return
-        
-    df = perform_map_matching(df, edges_gdf.crs, network_path, config)
-    if df.empty:
-        return
-        
-    # Filter segments with fewer than 10 unique vehicles or in removed_segments
-    print(f"Filtering segments (Min {config['min_vehicles_per_segment']} vehicles, Exclude blacklist: {len(config['removed_segments'])})...")
-    seg_counts = df[df['segment_id'] != ""].groupby('segment_id')['track_id'].nunique()
-    
-    # Identify segments that meet the volume threshold AND are not in the blacklist
-    valid_segments = [s for s in seg_counts.index if s not in config["removed_segments"] and seg_counts[s] >= config["min_vehicles_per_segment"]]
-    
-    initial_count = len(df)
-    df = df[df['segment_id'].isin(valid_segments)].reset_index(drop=True)
-    
-    num_removed_segs = len(seg_counts) - len(valid_segments)
-    print(f"Removed {initial_count - len(df)} points across {num_removed_segs} segments (low volume or blacklisted).")
-
     file_name = os.path.splitext(os.path.basename(input_file))[0]
     date_part = file_name.split('_')[0]
     output_dir = os.path.join("processed_data", date_part, file_name)
@@ -648,24 +634,73 @@ def process_single_file(input_file, edges_gdf, network_path, args, config):
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
+
+    log_file = os.path.join(output_dir, 'map-matching.log')
+    logger = logging.getLogger(f"logger_{file_name}")
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    formatter = logging.Formatter('%(message)s')
+    fh = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    
+    logger.info(f"\n--- Processing {input_file} ---")
+    global_logger.info(f"Started processing {input_file}")
+    
+    df = parse_pneuma_to_long(input_file, config, logger, test=args.test)
+    if df.empty:
+        logger.info("No data parsed.")
+        global_logger.info(f"Skipped {input_file}: No data parsed.")
+        return {}
+        
+    df = perform_map_matching(df, edges_gdf.crs, network_path, config, logger)
+    if df.empty:
+        global_logger.info(f"Skipped {input_file}: No matched trajectories.")
+        return {}
+        
+    # Filter segments with fewer than 10 unique vehicles or in removed_segments
+    logger.info(f"Filtering segments (Min {config['min_vehicles_per_segment']} vehicles, Exclude blacklist: {len(config['removed_segments'])})...")
+    seg_counts = df[df['segment_id'] != ""].groupby('segment_id')['track_id'].nunique()
+    
+    # Identify segments to remove due to blacklist
+    blacklisted_present = [s for s in seg_counts.index if s in config["removed_segments"]]
+    points_in_blacklisted = len(df[df['segment_id'].isin(blacklisted_present)])
+    
+    # Identify segments to remove due to low volume (that are not already blacklisted)
+    low_volume_segments = [s for s in seg_counts.index if s not in config["removed_segments"] and seg_counts[s] < config["min_vehicles_per_segment"]]
+    points_in_low_volume = len(df[df['segment_id'].isin(low_volume_segments)])
+    
+    logger.info(f"Removed {points_in_blacklisted} points across {len(blacklisted_present)} blacklisted segments.")
+    logger.info(f"Removed {points_in_low_volume} points across {len(low_volume_segments)} low volume segments (< {config['min_vehicles_per_segment']} vehicles).")
+    
+    # Identify segments that meet the volume threshold AND are not in the blacklist
+    valid_segments = [s for s in seg_counts.index if s not in config["removed_segments"] and seg_counts[s] >= config["min_vehicles_per_segment"]]
+    
+    df = df[df['segment_id'].isin(valid_segments)].reset_index(drop=True)
     
     # Export filtered road network
     filtered_network_path = os.path.join(output_dir, 'osm_network.gpkg')
-    print(f"Exporting filtered road network to {filtered_network_path}...")
+    logger.info(f"Exporting filtered road network to {filtered_network_path}...")
     # Ensure IDs are compared as strings to match valid_segments list
     filtered_edges = edges_gdf[edges_gdf['segment_id'].astype(str).isin(valid_segments)]
     filtered_edges.to_file(filtered_network_path, driver='GPKG')
 
-    df = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, test=args.test)
-    empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir, config)
+    df, detected_lanes = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logger, test=args.test)
+    empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir, config, logger)
     
     # Export matched trajectories for feature extraction pipeline
     matched_trajectories_path = os.path.join(output_dir, "matched_trajectories.csv")
-    print(f"Exporting matched trajectories to {matched_trajectories_path}...")
+    logger.info(f"Exporting matched trajectories to {matched_trajectories_path}...")
     df.to_csv(matched_trajectories_path, index=False)
     
-    print(f"\nFinished mapping processing for {input_file}! Saved output to {output_dir}")
-    print(f"Execution for this file took {time.time() - file_start_time:.2f} seconds.")
+    logger.info(f"\nFinished mapping processing for {input_file}! Saved output to {output_dir}")
+    logger.info(f"Execution for this file took {time.time() - file_start_time:.2f} seconds.")
+    global_logger.info(f"Finished processing {input_file} in {time.time() - file_start_time:.2f} seconds.")
+    return detected_lanes
 
 def main():
     parser = argparse.ArgumentParser()
@@ -677,15 +712,21 @@ def main():
     
     with open('removed_segments.json', 'r') as f:
         removed_segments_list = json.load(f)
-    with open('fixed_segments.json', 'r') as f:
-        fixed_segments_dict = json.load(f)
+    with open('segment_lanes.json', 'r') as f:
+        segment_lanes_dict = json.load(f)
+        
+    segment_boundaries_dict = {}
+    if os.path.exists('segment_boundaries.json'):
+        with open('segment_boundaries.json', 'r') as f:
+            segment_boundaries_dict = json.load(f)
 
     config = {
         "sampling_interval": 1000,
         "test_percentage": 0.05,
-        "debug_segments": ["1750", "1909", "1751", "1756", "1753", "1834", "2227", "1836","208","220"],
+        "debug_segments": ["1750", "1909", "1751", "1756", "1753","1760", "1834", "2227", "1836","208","220"],
         "removed_segments": removed_segments_list,
-        "fixed_segments": fixed_segments_dict,
+        "segment_lanes": segment_lanes_dict,
+        "segment_boundaries": segment_boundaries_dict,
         "map_matching_max_dist_start": 5,
         "map_matching_max_dist_end": 50,
         "map_matching_step": 5,
@@ -707,23 +748,74 @@ def main():
         "default_speed_fallback": 10.0
     }
     
+    os.makedirs("processed_data", exist_ok=True)
+    global_log_file = os.path.join("processed_data", "map-matching.log")
+    global_logger = logging.getLogger("global_logger")
+    global_logger.setLevel(logging.INFO)
+    if global_logger.hasHandlers():
+        global_logger.handlers.clear()
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
+    gfh = logging.FileHandler(global_log_file, mode='w', encoding='utf-8')
+    gfh.setFormatter(formatter)
+    global_logger.addHandler(gfh)
+    gch = logging.StreamHandler()
+    gch.setFormatter(formatter)
+    global_logger.addHandler(gch)
+    
+    global_logger.info("Pipeline started.")
+
     if os.path.isdir(args.input_path):
         files = sorted([os.path.join(args.input_path, f) for f in os.listdir(args.input_path) if f.endswith('.csv')])
     else:
         files = [args.input_path]
         
     if not files:
-        print("No CSV file(s) found.")
+        global_logger.info("No CSV file(s) found.")
         return
         
-    print("Loading OSM network...")
+    global_logger.info("Loading OSM network...")
     network_path = 'osm_network_merged.gpkg'
     edges_gdf = gpd.read_file(network_path)
     
+    all_detected_lanes = {}
     for input_file in files:
-        process_single_file(input_file, edges_gdf, network_path, args, config)
+        file_detected_lanes = process_single_file(input_file, edges_gdf, network_path, args, config, global_logger)
+        if file_detected_lanes:
+            for seg_id, count in file_detected_lanes.items():
+                if seg_id not in all_detected_lanes:
+                    all_detected_lanes[seg_id] = []
+                all_detected_lanes[seg_id].append(count)
 
-    print(f"\nTotal mapping execution completed in {time.time() - overall_start:.2f} seconds.")
+    osm_lanes = {}
+    for _, row in edges_gdf.iterrows():
+        seg_id = str(row['segment_id'])
+        try:
+            lanes = int(row['lanes'])
+        except (ValueError, TypeError):
+            lanes = 2
+        osm_lanes[seg_id] = lanes
+        
+    average_detected_lanes = {}
+    for seg_id, counts in all_detected_lanes.items():
+        average_detected_lanes[seg_id] = sum(counts) / len(counts)
+        
+    avg_lanes_file = os.path.join("processed_data", "average_detected_lanes.json")
+    with open(avg_lanes_file, "w") as f:
+        json.dump(average_detected_lanes, f, indent=4)
+    global_logger.info(f"Saved average detected lanes to {avg_lanes_file}")
+    
+    mismatch_log_file = os.path.join("processed_data", "lane-mismatch.log")
+    mismatches_found = 0
+    with open(mismatch_log_file, "w") as f:
+        for seg_id, avg_lanes in average_detected_lanes.items():
+            osm_count = osm_lanes.get(seg_id, 2)
+            if avg_lanes != osm_count:
+                f.write(f"Segment {seg_id}: Average Detected = {avg_lanes:.2f}, OSM Defined = {osm_count}\n")
+                mismatches_found += 1
+                
+    global_logger.info(f"Found {mismatches_found} segments with lane mismatches. See {mismatch_log_file}")
+
+    global_logger.info(f"Total mapping execution completed in {time.time() - overall_start:.2f} seconds.")
 
 if __name__ == '__main__':
     main()
