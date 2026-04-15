@@ -51,8 +51,8 @@ def visualize_adjacency(network_file, adjacency_file):
     edges['banned_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'banned_successors'))
     edges['only_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'only_successors'))
     
-    # Ensure turn information columns exist before adding them to hover data
-    for col in ['turn:lanes', 'turn']:
+    # Ensure relevant columns exist before adding them to hover data
+    for col in ['turn:lanes', 'turn', 'is_internal_junction', 'junction_rule_semantic', 'junction_rule_topo', 'junction_rule_spatial']:
         if col not in edges.columns:
             edges[col] = "None"
         else:
@@ -135,17 +135,10 @@ def visualize_adjacency(network_file, adjacency_file):
             "oneway": True,
             "lanes": True,
             "turn:lanes": True,
-            "turn": True,
-            "to_info": True,
-            "from_info": True,
-            "crossed_by_info": True,
-            "turns_into_info": True,
-            "merges_into_info": True,
-            "u_turns_into_info": True,
-            "crosses_info": True,
-            "banned_successors_info": True,
-            "only_successors_info": True,
-            "opposite_direction_info": True,
+            "is_internal_junction": True,
+            "junction_rule_semantic": True,
+            "junction_rule_topo": True,
+            "junction_rule_spatial": True,
             "lat": False,
             "lon": False
         },
@@ -154,29 +147,55 @@ def visualize_adjacency(network_file, adjacency_file):
         title="Adjacency Debugger: Click a segment point to highlight its neighbors"
     )
 
-    # Add ALL road lines as a faint background layer
-    lats = []
-    lons = []
-    for coords in geo_map.values():
+    # Add background roads and junction highlighted roads
+    bg_lats, bg_lons = [], []
+    junc_lats, junc_lons = [], []
+    
+    for idx, row in edges.iterrows():
+        sid = row['segment_id_str']
+        coords = geo_map.get(sid, [])
+        is_junc = str(row.get('is_internal_junction', 'False')).lower() == 'true'
+        
         for pt in coords:
-            lats.append(pt[0])
-            lons.append(pt[1])
-        lats.append(None)
-        lons.append(None)
+            if pt[0] is not None:
+                if is_junc:
+                    junc_lats.append(pt[0])
+                    junc_lons.append(pt[1])
+                else:
+                    bg_lats.append(pt[0])
+                    bg_lons.append(pt[1])
+        
+        if is_junc:
+            junc_lats.append(None)
+            junc_lons.append(None)
+        else:
+            bg_lats.append(None)
+            bg_lons.append(None)
     
     bg_roads = go.Scattermap(
-        lat=lats,
-        lon=lons,
+        lat=bg_lats,
+        lon=bg_lons,
         mode='lines',
         line=dict(width=2, color='rgba(100, 100, 100, 0.2)'),
         hoverinfo='skip',
         showlegend=False
     )
-    fig.add_trace(bg_roads)
     
-    # Reorder: roads at bottom
+    junc_roads = go.Scattermap(
+        lat=junc_lats,
+        lon=junc_lons,
+        mode='lines',
+        line=dict(width=3, color='rgba(255, 165, 0, 0.8)'),
+        name='Internal Junctions',
+        hoverinfo='skip',
+        showlegend=False
+    )
+    fig.add_trace(bg_roads)
+    fig.add_trace(junc_roads)
+    
+    # Reorder: background roads at bottom, then junction roads, then scatter points
     data_list = list(fig.data)
-    fig.data = (data_list[1], data_list[0])
+    fig.data = (data_list[-2], data_list[-1], data_list[0])
 
     print("Preparing interactive HTML...")
 
@@ -440,10 +459,10 @@ def visualize_adjacency(network_file, adjacency_file):
                 }}
             }});
 
-            // Clear previous highlight traces (indices 2 onwards)
+            // Clear previous highlight traces (indices 3 onwards)
             var currentTracesCount = plotEl.data.length;
             var indicesToRemove = [];
-            for (var i = 2; i < currentTracesCount; i++) indicesToRemove.push(i);
+            for (var i = 3; i < currentTracesCount; i++) indicesToRemove.push(i);
             
             // Note: deleteTraces is synchronous but indices shift. 
             // It's safer to remove from end or use a single call.
