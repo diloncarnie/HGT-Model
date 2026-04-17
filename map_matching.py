@@ -8,6 +8,7 @@ import logging
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import networkx as nx
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -348,6 +349,69 @@ def perform_map_matching(df, crs, gpkg_path, config, logger):
     logger.info(f"Map matching and distance calculation took {time.time() - start_time:.2f} seconds. Matched {len(final_df)} points.")
     return final_df
 
+def filter_hq_d_values(d_vals, speeds, rel_headings, config):
+    """Filter D values to a high-quality subset using progressive speed thresholds."""
+    for s_thresh in config["jenks_speed_thresholds"]:
+        mask = (speeds > s_thresh) & (rel_headings < config["jenks_heading_threshold"])
+        if mask.sum() >= config["jenks_min_points"]:
+            return d_vals[mask]
+    return d_vals
+
+
+def density_prioritized_sample(hq_d, config):
+    """Generate a sample that favors more dense bins for the Jenks algorithm."""
+    if len(hq_d) == 0:
+        return hq_d
+
+    sampling_budget = min(len(hq_d), config.get("jenks_max_target_calc", 15000))
+    if len(hq_d) <= sampling_budget:
+        return hq_d
+
+    counts, bins = np.histogram(hq_d, bins=config.get("jenks_bins", 40))
+    
+    # Exaggerate density using a power > 1. 
+    # density_power = 1.0 is strictly proportional. 
+    # density_power = 2.0 squares the counts, heavily biasing the sample towards the densest bins.
+    density_power = config.get("jenks_density_power", 1.0)
+    weights = np.power(counts, density_power)
+    
+    # Avoid division by zero if all weights become 0
+    if np.sum(weights) == 0:
+        bin_probs = np.ones(len(counts)) / len(counts)
+    else:
+        bin_probs = weights / np.sum(weights)
+
+    # Allocate the sampling budget across bins based on the skewed probabilities
+    samples_per_bin = np.round(bin_probs * sampling_budget).astype(int)
+
+    samples = []
+
+    for i in range(len(counts)):
+        if counts[i] == 0:
+            continue
+        bin_mask = (hq_d >= bins[i]) & (hq_d <= bins[i+1])
+        bin_vals = hq_d[bin_mask]
+        
+        # Take the allocated amount, capping at the actual number of points in the bin
+        num_to_take = min(samples_per_bin[i], len(bin_vals))
+        
+        if num_to_take > 0:
+            samples.extend(np.random.choice(bin_vals, num_to_take, replace=False))
+            
+    return np.array(samples)
+
+
+def jenks_breaks_with_fallback(sample, k, road_min, road_max):
+    """Compute Jenks breaks for a known k. Falls back to equal-width breaks on failure."""
+    if k <= 1:
+        return [road_min, road_max]
+    try:
+        return list(jenkspy.jenks_breaks(sample, n_classes=k))
+    except ValueError:
+        max_distance = max(road_max - road_min, 1e-6)
+        return [road_min + i * (max_distance / k) for i in range(k + 1)]
+
+
 def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logger, test=False):
     if test:
         logger.info("Performing Jenks Optimization...")
@@ -389,42 +453,34 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logge
         num_lanes_osm = int(group['num_lanes'].iloc[0])
 
         if len(D_vals) > config["jenks_min_points"]:
-            # Iterative filtering for speed (5, 3, 1) while maintaining the current rel_heading filter
-            hq_D_final = None
-            for s_thresh in config["jenks_speed_thresholds"]:
-                mask = (group['speed'] > s_thresh) & (group['rel_heading'] < config["jenks_heading_threshold"])
-                if mask.sum() >= config["jenks_min_points"]:
-                    hq_D_final = D_vals[mask.values]
-                    if test:
-                        logger.info(f"Segment {seg_id}: Retained {len(hq_D_final)} points using speed > {s_thresh}")
-                    break
-            
-            if hq_D_final is None:
-                hq_D_final = D_vals
-                if test:
-                    logger.info(f"Segment {seg_id}: Defaulting to original distribution")
+            hq_D_final = filter_hq_d_values(D_vals, group['speed'].values, group['rel_heading'].values, config)
+            if test:
+                logger.info(f"Segment {seg_id}: Using {len(hq_D_final)} HQ points for Jenks.")
 
-            # Use raw min/max instead of percentiles
             road_min, road_max = hq_D_final.min(), hq_D_final.max()
-            hq_D_trimmed = hq_D_final # No longer trimming
-
-            # Balanced Sampling: Take an equal-ish number of samples from across the distribution
-            counts, bins = np.histogram(hq_D_trimmed, bins=config["jenks_bins"])
-            target_per_bin = max(config["jenks_target_per_bin"], config["jenks_max_target_calc"] // (len(counts[counts > 0]) or 1))
-
-            balanced_sample = []
-            for i in range(len(counts)):
-                if counts[i] == 0: continue
-                bin_mask = (hq_D_trimmed >= bins[i]) & (hq_D_trimmed <= bins[i+1])
-                bin_vals = hq_D_trimmed[bin_mask]
-                balanced_sample.extend(np.random.choice(bin_vals, min(len(bin_vals), target_per_bin), replace=False))
-
-            sample = np.array(balanced_sample)
+            sample = density_prioritized_sample(hq_D_final, config)
 
             # Iterative Lane Partitioning: Start with max_distance / avg_lane_width
             max_distance = (road_max - road_min)  
             avg_lane_width = config["avg_lane_width"]
-            initial_k = max(1, round(max_distance / avg_lane_width))
+            
+            is_link_highway = str(group['highway'].iloc[0]).endswith('_link')
+            seg_edge = edges_gdf[edges_gdf['segment_id'].astype(str) == str(seg_id)]
+            is_internal_junc = False
+            has_osm_lanes = False
+            
+            if not seg_edge.empty:
+                if 'is_internal_junction' in seg_edge.columns:
+                    is_internal_junc = str(seg_edge['is_internal_junction'].iloc[0]).lower() == 'true'
+                if 'lanes' in seg_edge.columns:
+                    has_osm_lanes = pd.notna(seg_edge['lanes'].iloc[0])
+                
+            is_link = is_link_highway or is_internal_junc
+            
+            if is_link and has_osm_lanes:
+                initial_k = max(1, num_lanes_osm)
+            else:
+                initial_k = max(1, round(max_distance / avg_lane_width))
 
             best_breaks = None
             if seg_id in config["segment_lanes"]:
@@ -443,6 +499,21 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logge
                         failed_segments.append(seg_id)
                         if test:
                             logger.info(f"Segment {seg_id}: Manual override applied. Jenks failed, using equal widths for {k} lanes.")
+            elif is_link:
+                if initial_k == 1:
+                    best_breaks = [road_min, road_max]
+                    if test:
+                        logger.info(f"Segment {seg_id}: Link segment detected. Bypassed validation, assigned 1 lane [road_min, road_max].")
+                else:
+                    try:
+                        best_breaks = jenkspy.jenks_breaks(sample, n_classes=initial_k)
+                        if test:
+                            logger.info(f"Segment {seg_id}: Link segment detected. Bypassed validation, assigned {initial_k} lanes using Jenks.")
+                    except ValueError:
+                        best_breaks = [road_min + i * (max_distance / initial_k) for i in range(initial_k + 1)]
+                        failed_segments.append(seg_id)
+                        if test:
+                            logger.info(f"Segment {seg_id}: Link segment detected. Jenks failed, using equal widths for {initial_k} lanes.")
             elif initial_k == 1:
                 # Informed decision for 1 lane: Try Jenks for 2 or 3 lanes.
                 for k in [2, 3]:
@@ -691,6 +762,89 @@ def process_single_file(input_file, edges_gdf, network_path, args, config, globa
     # Identify segments that meet the volume threshold AND are not in the blacklist
     valid_segments = [s for s in seg_counts.index if s not in config["removed_segments"] and seg_counts[s] >= config["min_vehicles_per_segment"]]
     
+    valid_segments_set = set(valid_segments)
+    
+    # Rule 1: Include shape junction links if they connect to a shape where at least one segment is valid
+    if 'is_shape_junction' in edges_gdf.columns:
+        shape_edges = edges_gdf[edges_gdf['is_shape_junction'].astype(str).str.lower() == 'true']
+        if not shape_edges.empty:
+            G_shape = nx.MultiGraph()
+            for _, row in shape_edges.iterrows():
+                G_shape.add_edge(row['u'], row['v'], segment_id=str(row['segment_id']))
+                
+            for component in nx.connected_components(G_shape):
+                subgraph = G_shape.subgraph(component)
+                comp_segment_ids = {data['segment_id'] for _, _, _, data in subgraph.edges(keys=True, data=True)}
+                
+                # If any segment in this shape component is in the currently valid segments, keep the whole shape
+                if comp_segment_ids.intersection(valid_segments_set):
+                    valid_segments_set.update(comp_segment_ids)
+
+    # Rule 2: Remove fully disconnected valid segments (isolated edges or isolated two-way pairs)
+    valid_edges = edges_gdf[edges_gdf['segment_id'].astype(str).isin(valid_segments_set)]
+    G_valid = nx.MultiGraph()
+    for _, row in valid_edges.iterrows():
+        G_valid.add_edge(row['u'], row['v'], segment_id=str(row['segment_id']))
+        
+    isolated_segments = set()
+    for component in nx.connected_components(G_valid):
+        if len(component) <= 2:  # Component only has 1 or 2 nodes (isolated segment)
+            subgraph = G_valid.subgraph(component)
+            for u, v, key, data in subgraph.edges(keys=True, data=True):
+                isolated_segments.add(data['segment_id'])
+                
+    if isolated_segments:
+        valid_segments_set -= isolated_segments
+        logger.info(f"Removed {len(isolated_segments)} fully disconnected valid segments.")
+        
+    # Rule 3: Remove segments with no topological influence
+    adjacency = config.get("topological_adjacency", {})
+    if adjacency:
+        while True:
+            isolated_topo_segments = set()
+            valid_str_set = {str(sid) for sid in valid_segments_set}
+            
+            # Pre-compute active incoming connections to speed up the check
+            active_incoming = set()
+            for sid_str in valid_str_set:
+                if sid_str in adjacency:
+                    adj = adjacency[sid_str]
+                    out_targets = adj.get('to', []) + adj.get('turns_into', []) + \
+                                  adj.get('merges_into', []) + adj.get('u_turns_into', [])
+                    for tgt in out_targets:
+                        if str(tgt) in valid_str_set:
+                            active_incoming.add(str(tgt))
+
+            for sid in valid_segments_set:
+                sid_str = str(sid)
+                is_connected = False
+                
+                # Check outgoing and crossing relations
+                if sid_str in adjacency:
+                    adj = adjacency[sid_str]
+                    out_targets = adj.get('to', []) + adj.get('turns_into', []) + \
+                                  adj.get('merges_into', []) + adj.get('u_turns_into', []) + \
+                                  adj.get('crosses', []) + adj.get('crossed_by', [])
+                    
+                    if any(str(tgt) in valid_str_set for tgt in out_targets):
+                        is_connected = True
+                
+                # Check incoming relations (if another valid segment points to this one)
+                if not is_connected and sid_str in active_incoming:
+                    is_connected = True
+                    
+                if not is_connected:
+                    logger.info(f"Segment {sid} is topologically isolated and will be removed.")
+                    isolated_topo_segments.add(sid)
+                    
+            if not isolated_topo_segments:
+                break
+                
+            valid_segments_set -= isolated_topo_segments
+            logger.info(f"Removed {len(isolated_topo_segments)} topologically isolated segments.")
+
+    valid_segments = list(valid_segments_set)
+    
     df = df[df['segment_id'].isin(valid_segments)].reset_index(drop=True)
     
     # Export filtered road network
@@ -730,14 +884,23 @@ def main():
     if os.path.exists('segment_boundaries.json'):
         with open('segment_boundaries.json', 'r') as f:
             segment_boundaries_dict = json.load(f)
+            
+    topological_adjacency_dict = {}
+    if os.path.exists('topological_adjacency.json'):
+        with open('topological_adjacency.json', 'r') as f:
+            topological_adjacency_dict = json.load(f)
+    elif os.path.exists('topological_adjacency_merged.json'):
+        with open('topological_adjacency_merged.json', 'r') as f:
+            topological_adjacency_dict = json.load(f)
 
     config = {
         "sampling_interval": 1000,
         "test_percentage": 0.05,
-        "debug_segments": [],
+        "debug_segments": ["2423","1822","69", "2461"],
         "removed_segments": removed_segments_list,
         "segment_lanes": segment_lanes_dict,
         "segment_boundaries": segment_boundaries_dict,
+        "topological_adjacency": topological_adjacency_dict,
         "map_matching_max_dist_start": 5,
         "map_matching_max_dist_end": 50,
         "map_matching_step": 5,
@@ -746,10 +909,11 @@ def main():
         "partial_traversal_prop_thresh": 0.6,
         "min_vehicles_per_segment": 5,
         "jenks_min_points": 50,
-        "jenks_speed_thresholds": [7.5, 5.0, 3.0, 1.0],
+        "jenks_speed_thresholds": [1.0],
         "jenks_heading_threshold": 5.0,
         "jenks_target_per_bin": 10,
         "jenks_max_target_calc": 15000,
+        "jenks_density_power": 1.0,
         "jenks_bins": 40,
         "avg_lane_width": 3.2,
         "min_lane_width_loose": 1.6,
@@ -809,13 +973,20 @@ def main():
             lanes = None
         osm_lanes[seg_id] = lanes
         
+    segment_lane_features = {}
     average_detected_lanes = {}
     for seg_id, counts in all_detected_lanes.items():
-        average_detected_lanes[seg_id] = round(sum(counts) / len(counts))
+        avg_lanes = round(sum(counts) / len(counts))
+        average_detected_lanes[seg_id] = avg_lanes
+        segment_lane_features[seg_id] = {
+            "average_detected_lanes": avg_lanes,
+            "detected_lanes_list": counts,
+            "osm_defined_lanes": osm_lanes.get(seg_id)
+        }
         
     avg_lanes_file = os.path.join("processed_data", "average_detected_lanes.json")
     with open(avg_lanes_file, "w") as f:
-        json.dump(average_detected_lanes, f, indent=4)
+        json.dump(segment_lane_features, f, indent=4)
     global_logger.info(f"Saved average detected lanes to {avg_lanes_file}")
     
     mismatch_log_file = os.path.join("processed_data", "lane-mismatch.log")

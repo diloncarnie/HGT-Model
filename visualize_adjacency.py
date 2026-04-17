@@ -19,6 +19,49 @@ def visualize_adjacency(network_file, adjacency_file):
 
     print(f"Loading data...")
     edges = gpd.read_file(network_file)
+    
+    # Calculate filled junction shapes using original CRS (UTM) for accurate metrics
+    from shapely.ops import polygonize
+    junction_edges_utm = edges[edges['is_internal_junction'].astype(str).str.lower() == 'true']
+
+    # Deduplicate by undirected endpoint pair: two-way roads produce two directed
+    # edges with overlapping reversed geometry, which blocks polygonize from closing
+    # shapes that include a two-way segment.
+    seen_pairs = set()
+    unique_junction_geoms = []
+    for u, v, geom in zip(junction_edges_utm['u'], junction_edges_utm['v'], junction_edges_utm.geometry):
+        key = frozenset((u, v))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        unique_junction_geoms.append(geom)
+
+    polygons_utm = list(polygonize(unique_junction_geoms))
+    
+    poly_stats = []
+    if polygons_utm:
+        for poly in polygons_utm:
+            area_sqm = poly.area
+            perimeter_m = poly.length
+            
+            bound = poly.boundary
+            edge_count = 0
+            for edge_geom in junction_edges_utm.geometry:
+                if edge_geom.intersection(bound).length > 1e-5:
+                    edge_count += 1
+                    
+            poly_stats.append({
+                'area': area_sqm,
+                'perimeter': perimeter_m,
+                'edge_count': edge_count
+            })
+            
+        polys_gdf = gpd.GeoDataFrame(geometry=polygons_utm, crs=edges.crs)
+        polys_gdf_4326 = polys_gdf.to_crs("EPSG:4326")
+        polygons_4326 = polys_gdf_4326.geometry.tolist()
+    else:
+        polygons_4326 = []
+        
     if edges.crs != "EPSG:4326":
         edges = edges.to_crs("EPSG:4326")
         
@@ -52,7 +95,7 @@ def visualize_adjacency(network_file, adjacency_file):
     edges['only_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'only_successors'))
     
     # Ensure relevant columns exist before adding them to hover data
-    for col in ['turn:lanes', 'turn', 'is_internal_junction', 'junction_rule_semantic', 'junction_rule_topo', 'junction_rule_spatial']:
+    for col in ['turn:lanes', 'turn', 'junction', 'is_internal_junction', 'is_shape_junction', 'is_semantic_junction']:
         if col not in edges.columns:
             edges[col] = "None"
         else:
@@ -60,7 +103,7 @@ def visualize_adjacency(network_file, adjacency_file):
 
     print("Generating base map...")
     # Calculate rightward perpendicular shift to separate perfectly overlapping opposite-direction segments
-    SHIFT_OFFSET = 0.00002 # ~3 meters offset
+    SHIFT_OFFSET = 0.00003 # ~3 meters offset
     
     lats = []
     lons = []
@@ -135,10 +178,10 @@ def visualize_adjacency(network_file, adjacency_file):
             "oneway": True,
             "lanes": True,
             "turn:lanes": True,
+            "junction": True,
             "is_internal_junction": True,
-            "junction_rule_semantic": True,
-            "junction_rule_topo": True,
-            "junction_rule_spatial": True,
+            "is_shape_junction": True,
+            "is_semantic_junction": True,
             "lat": False,
             "lon": False
         },
@@ -147,7 +190,7 @@ def visualize_adjacency(network_file, adjacency_file):
         title="Adjacency Debugger: Click a segment point to highlight its neighbors"
     )
 
-    # Add background roads and junction highlighted roads
+    # Add background roads, junction highlighted roads, and filled junction shapes
     bg_lats, bg_lons = [], []
     junc_lats, junc_lons = [], []
     
@@ -171,6 +214,32 @@ def visualize_adjacency(network_file, adjacency_file):
         else:
             bg_lats.append(None)
             bg_lons.append(None)
+            
+    # Prepare filled junction shapes traces using GeoJSON for face hover
+    shape_features = []
+    shape_locations = []
+    shape_z = []
+    shape_hovertexts = []
+    
+    for i, poly in enumerate(polygons_4326):
+        stats = poly_stats[i]
+        hover_text = f"<b>Junction Shape</b><br>Area: {stats['area']:.1f} sq m<br>Perimeter: {stats['perimeter']:.1f} m<br>Edges: {stats['edge_count']}"
+        
+        shape_locations.append(str(i))
+        shape_z.append(1)
+        shape_hovertexts.append(hover_text)
+        
+        shape_features.append({
+            "type": "Feature",
+            "id": str(i),
+            "geometry": poly.__geo_interface__,
+            "properties": {}
+        })
+
+    geojson_data = {
+        "type": "FeatureCollection",
+        "features": shape_features
+    }
     
     bg_roads = go.Scattermap(
         lat=bg_lats,
@@ -186,16 +255,32 @@ def visualize_adjacency(network_file, adjacency_file):
         lon=junc_lons,
         mode='lines',
         line=dict(width=3, color='rgba(255, 165, 0, 0.8)'),
-        name='Internal Junctions',
+        name='Internal Junction Links',
         hoverinfo='skip',
-        showlegend=False
+        showlegend=True
     )
+    
+    # Use Choroplethmap to allow hovering over the polygon faces
+    junc_shapes = go.Choroplethmap(
+        geojson=geojson_data,
+        locations=shape_locations,
+        z=shape_z,
+        colorscale=[[0, 'rgba(255, 0, 0, 0.3)'], [1, 'rgba(255, 0, 0, 0.3)']],
+        marker_line_width=1,
+        marker_line_color='rgba(255, 0, 0, 0.8)',
+        showscale=False,
+        text=shape_hovertexts,
+        hoverinfo='text',
+        name='Junction Shapes'
+    )
+    
     fig.add_trace(bg_roads)
     fig.add_trace(junc_roads)
+    fig.add_trace(junc_shapes)
     
-    # Reorder: background roads at bottom, then junction roads, then scatter points
+    # Reorder: background roads at bottom, then junction shapes, then junction lines, then scatter points
     data_list = list(fig.data)
-    fig.data = (data_list[-2], data_list[-1], data_list[0])
+    fig.data = (data_list[-3], data_list[-1], data_list[-2], data_list[0])
 
     print("Preparing interactive HTML...")
 
@@ -459,11 +544,11 @@ def visualize_adjacency(network_file, adjacency_file):
                 }}
             }});
 
-            // Clear previous highlight traces (indices 3 onwards)
+            // Clear previous highlight traces (indices 4 onwards)
             var currentTracesCount = plotEl.data.length;
             var indicesToRemove = [];
-            for (var i = 3; i < currentTracesCount; i++) indicesToRemove.push(i);
-            
+            for (var i = 4; i < currentTracesCount; i++) indicesToRemove.push(i);
+
             // Note: deleteTraces is synchronous but indices shift. 
             // It's safer to remove from end or use a single call.
             if (indicesToRemove.length > 0) {{
@@ -488,7 +573,7 @@ def visualize_adjacency(network_file, adjacency_file):
 
 def main():
     parser = argparse.ArgumentParser(description="Interactively visualize road adjacency.")
-    parser.add_argument('--network_file', default="osm_network.gpkg", help="Path to osm_network.gpkg")
+    parser.add_argument('--network-file', default="osm_network.gpkg", help="Path to osm_network.gpkg")
     parser.add_argument('--adjacency_file', default="topological_adjacency.json", help="Path to topological_adjacency.json")
     args = parser.parse_args()
     

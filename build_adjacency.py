@@ -8,7 +8,7 @@ import os
 import numpy as np
 import requests
 import ast
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon, MultiPolygon
 import time
 import logging
 
@@ -29,7 +29,7 @@ logger = setup_logger("build_adjacency", "build-adjacency.log")
 turn_restrictions_logger = setup_logger("turn_restrictions", "turn_restrictions.log")
 junctions_logger = setup_logger("junctions", "junction_detections.log")
 
-def get_osm_network(bbox):
+def get_osm_network(bbox, config):
     # Instruct OSMnx to retain advanced routing and road rule tags
     ox.settings.useful_tags_way += ['turn:lanes', 'turn', 'junction', 'access']
     
@@ -37,7 +37,7 @@ def get_osm_network(bbox):
     # Download using the provided bounding box
     graph = ox.graph_from_bbox(bbox=bbox, network_type='all', simplify=False)
 
-    valid_highway_types = ['primary', 'secondary', 'tertiary', 'trunk', 'residential', 'unclassified', 'living_street', 'road', 'primary_link', 'secondary_link', 'tertiary_link', 'trunk_link', 'motorway', 'motorway_link']
+    valid_highway_types = config["valid_highway_types"]
     edges_to_keep = []
     for u, v, k, data in graph.edges(keys=True, data=True):
         hw = data.get('highway')
@@ -52,7 +52,7 @@ def get_osm_network(bbox):
     # to allow OSMnx to merge them, while preventing merges of different lane counts.
     changed = True
     iterations = 0
-    while changed and iterations < 10:
+    while changed and iterations < config["lane_prop_iterations"]:
         changed = False
         iterations += 1
         for node in filtered_graph.nodes():
@@ -133,8 +133,6 @@ def get_osm_network(bbox):
     if 'turn' not in edges.columns:
         edges['turn'] = "none"
         
-    def get_first_hw(x):
-        return x[0] if isinstance(x, list) else x
     edges['highway'] = edges['highway'].apply(get_first_hw)
     
     if 'junction' not in edges.columns:
@@ -142,50 +140,8 @@ def get_osm_network(bbox):
     else:
         edges['junction'] = edges['junction'].fillna("none").apply(get_first_hw).astype(str).str.lower()
         
-    logger.info("Identifying internal junction segments...")
-    try:
-        # OSMnx >= 2.0
-        G_undirected = ox.convert.to_undirected(graph_utm)
-    except AttributeError:
-        try:
-            # OSMnx 1.9+
-            G_undirected = ox.utils_graph.get_undirected(graph_utm)
-        except AttributeError:
-            # OSMnx < 1.9
-            G_undirected = ox.get_undirected(graph_utm)
-    intersection_nodes = {node for node, degree in G_undirected.degree() if degree > 2}
-
-    is_link = edges['highway'].astype(str).str.endswith('_link')
-    has_junction_tag = ~edges['junction'].isin(['none', 'nan', 'no', '', 'null', '<na>'])
-
-    both_intersections = edges['u'].isin(intersection_nodes) & edges['v'].isin(intersection_nodes)
-    is_topo_junction = both_intersections & (edges['length'] < 15.0)
-
-    intersection_points = nodes[nodes.index.isin(intersection_nodes)]
-    if not intersection_points.empty:
-        intersection_buffers = intersection_points.geometry.buffer(10.0)
-        intersection_areas = intersection_buffers.union_all()
-        is_spatial_junction = edges.geometry.apply(lambda geom: geom.within(intersection_areas))
-    else:
-        is_spatial_junction = pd.Series(False, index=edges.index)
-
-    edges['junction_rule_semantic'] = is_link | has_junction_tag
-    edges['junction_rule_topo'] = is_topo_junction
-    edges['junction_rule_spatial'] = is_spatial_junction
-    edges['is_internal_junction'] = edges['junction_rule_semantic'] | edges['junction_rule_topo'] | edges['junction_rule_spatial']
-
-    for col in ['junction_rule_semantic', 'junction_rule_topo', 'junction_rule_spatial', 'is_internal_junction']:
-        edges[col] = edges[col].astype(str)
-        
-    semantic_ids = edges[edges['junction_rule_semantic'] == 'True']['segment_id'].tolist()
-    topo_ids = edges[edges['junction_rule_topo'] == 'True']['segment_id'].tolist()
-    spatial_ids = edges[edges['junction_rule_spatial'] == 'True']['segment_id'].tolist()
-        
-    num_total = (edges['is_internal_junction'] == 'True').sum()
-    junctions_logger.info(f"Detected {num_total} internal junction segments.")
-    junctions_logger.info(f"  - Semantic: {len(semantic_ids)} segments -> {semantic_ids}")
-    junctions_logger.info(f"  - Topological: {len(topo_ids)} segments -> {topo_ids}")
-    junctions_logger.info(f"  - Spatial: {len(spatial_ids)} segments -> {spatial_ids}")
+    logger.info("Initializing internal junction segments...")
+    edges['is_internal_junction'] = 'False'
 
     # Ensure turn metadata is flattened to strings in case simplification bundled them into lists
     edges['turn:lanes'] = edges['turn:lanes'].apply(get_first_hw).astype(str)
@@ -196,6 +152,16 @@ def get_osm_network(bbox):
     else:
         edges['oneway'] = "False"
     
+    # Halve the lanes for two-way segments to accurately represent the individual segment's lane count
+    def adjust_lanes(row):
+        lanes = row['lanes']
+        is_oneway = str(row['oneway']).lower() in ['true', 'yes', '1']
+        if pd.notna(lanes) and not is_oneway:
+            return max(1, math.ceil(lanes / 2.0))
+        return lanes
+        
+    edges['lanes'] = edges.apply(adjust_lanes, axis=1)
+
     return edges
 
 def get_smoothed_heading(geom, reverse=False, look_dist=10.0):
@@ -240,7 +206,7 @@ def get_smoothed_heading(geom, reverse=False, look_dist=10.0):
         
     return math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
 
-def get_turn_restrictions(edges_gdf):
+def get_turn_restrictions(edges_gdf, config):
     turn_restrictions_logger.info("Fetching turn restrictions from Overpass API...")
     
     # Ensure the bounding box is in Lat/Lon (EPSG:4326) for the Overpass API
@@ -249,16 +215,21 @@ def get_turn_restrictions(edges_gdf):
     else:
         minx, miny, maxx, maxy = edges_gdf.total_bounds
         
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    buffer = 0.001
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    buffer = config["overpass_buffer"]
     overpass_query = f"""
-    [out:json][timeout:5];
+    [out:json][timeout:30];
     relation["type"="restriction"]({miny-buffer},{minx-buffer},{maxy+buffer},{maxx+buffer});
-    out;
+    out body;
     """
     
+    headers = {
+        'User-Agent': 'HGT-Model-Script/1.0',
+        'Accept': 'application/json'
+    }
+    
     try:
-        response = requests.post(overpass_url, data={'data': overpass_query}, timeout=5)
+        response = requests.post(overpass_url, data={'data': overpass_query}, headers=headers, timeout=config["overpass_timeout"])
         restrictions = []
         if response.status_code == 200:
             data = response.json()
@@ -268,29 +239,46 @@ def get_turn_restrictions(edges_gdf):
                     restriction_type = tags.get('restriction', '')
                     from_way = None
                     to_way = None
+                    via_ways = []
+                    via_nodes = []
                     for member in element.get('members', []):
-                        if member['role'] == 'from' and member['type'] == 'way':
-                            from_way = str(member['ref'])
-                        elif member['role'] == 'to' and member['type'] == 'way':
-                            to_way = str(member['ref'])
+                        role = member.get('role')
+                        mtype = member.get('type')
+                        if role == 'from' and mtype == 'way':
+                            from_way = str(member.get('ref'))
+                        elif role == 'to' and mtype == 'way':
+                            to_way = str(member.get('ref'))
+                        elif role == 'via' and mtype == 'way':
+                            via_ways.append(str(member.get('ref')))
+                        elif role == 'via' and mtype == 'node':
+                            via_nodes.append(str(member.get('ref')))
                     if from_way and to_way and restriction_type:
                         restrictions.append({
                             'type': restriction_type,
                             'from': from_way,
-                            'to': to_way
+                            'to': to_way,
+                            'via_ways': via_ways,
+                            'via_nodes': via_nodes
                         })
-            turn_restrictions_logger.info(f"Found {len(restrictions)} turn restrictions.")
+            turn_restrictions_logger.info(f"Found {len(restrictions)} turn restrictions from Overpass API.")
             return restrictions
         else:
-            turn_restrictions_logger.info(f"Overpass API returned status {response.status_code}.")
+            turn_restrictions_logger.info(f"Overpass API returned status {response.status_code}. Response: {response.text[:200]}")
     except Exception as e:
         turn_restrictions_logger.warning(f"Failed to fetch turn restrictions from API: {e}")
         
-    turn_restrictions_logger.info("Falling back to local turn_restrictions.json...")
-    if os.path.exists("turn_restrictions.json"):
+    turn_restrictions_logger.info(f"Falling back to local {config['turn_restrictions_path']}...")
+    if os.path.exists(config["turn_restrictions_path"]):
         try:
-            with open("turn_restrictions.json", 'r') as f:
+            with open(config["turn_restrictions_path"], 'r') as f:
                 restrictions = json.load(f)
+            
+            if restrictions and len(restrictions) > 0 and 'via_ways' not in restrictions[0]:
+                turn_restrictions_logger.warning(f"Local {config['turn_restrictions_path']} is in an old format. Empty via_ways/via_nodes will be assumed.")
+                
+            for r in restrictions:
+                if 'via_ways' not in r: r['via_ways'] = []
+                if 'via_nodes' not in r: r['via_nodes'] = []
             turn_restrictions_logger.info(f"Successfully loaded {len(restrictions)} restrictions from local fallback.")
             return restrictions
         except Exception as e:
@@ -312,7 +300,12 @@ def parse_osmids(osmid_val):
         return [str(osmid_val)]
     return [str(osmid_val)]
 
-def build_topological_adjacency(edges_gdf, target_dist=55.0):
+
+def get_first_hw(x):
+        return x[0] if isinstance(x, list) else x
+    
+    
+def build_topological_adjacency(edges_gdf, config):
     logger.info("Building topological lookups...")
     # Grouping by node IDs
     edges_by_u = edges_gdf.groupby('u')['segment_id'].apply(list).to_dict()
@@ -321,16 +314,20 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
     adjacency = {}
     
     
-    restrictions = get_turn_restrictions(edges_gdf)
+    restrictions = get_turn_restrictions(edges_gdf, config)
     
-    with open("turn_restrictions.json", "w") as f:
+    with open(config["turn_restrictions_path"], "w") as f:
         json.dump(restrictions, f, indent=4)
-    turn_restrictions_logger.info("Saved all extracted turn restrictions to turn_restrictions.json for inspection.")
+    turn_restrictions_logger.info(f"Saved all extracted turn restrictions to {config['turn_restrictions_path']} for inspection.")
         
     banned_transitions = []
     only_transitions = []
-    
+
+    # Immediate-successor restrictions: from-way directly connected to to-way (no via-ways).
+    # Via-way restrictions are handled later during junction propagation.
     for r in restrictions:
+        if r.get('via_ways'):
+            continue
         rtype = r['type']
         if rtype.startswith('no_'):
             banned_transitions.append((r['from'], r['to'], rtype))
@@ -342,14 +339,16 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
     for _, row in edges_gdf.iterrows():
         sid = str(row['segment_id'])
         geom = row['geometry']
+        name_val = row['name'] if 'name' in row else ''
         segment_data[sid] = {
             'u': row['u'],
             'v': row['v'],
             'osmid': str(row['osmid']),
             'highway': str(row['highway']),
+            'name': get_first_hw(name_val),
             'length': float(row['length']),
-            'exit_heading': get_smoothed_heading(geom, reverse=False),
-            'entry_heading': get_smoothed_heading(geom, reverse=True)
+            'exit_heading': get_smoothed_heading(geom, reverse=False, look_dist=config["heading_look_dist"]),
+            'entry_heading': get_smoothed_heading(geom, reverse=True, look_dist=config["heading_look_dist"])
         }
 
     logger.info("Analyzing topological connections (choosing best fits)...")
@@ -388,16 +387,17 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             succ_heading = segment_data[sid_str]['entry_heading']
             delta_theta = (succ_heading - data['exit_heading'] + 180) % 360 - 180
             
-            if -25 <= delta_theta <= 25: direction = 'straight'
-            elif 25 < delta_theta < 170: direction = 'left'
-            elif -170 < delta_theta < -25: direction = 'right'
-            else: direction = 'u_turn'
+            if -config["angle_straight_thresh"] <= delta_theta <= config["angle_straight_thresh"]: direction = 'straight'
+            elif config["angle_straight_thresh"] < delta_theta <= config["angle_left_right_limit_basic"]: direction = 'left'
+            elif -config["angle_left_right_limit_basic"] <= delta_theta < -config["angle_straight_thresh"]: direction = 'right'
+            elif config["angle_u_turn_thresh"] <= abs(delta_theta) <= 180: direction = 'u_turn'
+            else: continue
             
             # Apply U-Turn Filters (Undivided Road, Mid-Block, Highway Classification)
             if direction == 'u_turn':
                 is_same_way = any(e_id in succ_osmids for e_id in ego_osmids)
                 hw_type = segment_data[ego_id]['highway']
-                banned_hw = ['primary', 'secondary', 'trunk', 'motorway', 'primary_link', 'secondary_link', 'trunk_link', 'motorway_link']
+                banned_hw = config["banned_u_turn_hw_types"]
                 is_banned_hw = hw_type in banned_hw
                 out_degree = len(potential_successors)
                 in_degree = len(edges_by_v.get(v_node, []))
@@ -439,13 +439,14 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
                 
                 if is_only:
                     only_successors.append(sid_str)
-                    best_succ = sid_str
-                    min_delta_succ = -1.0
+                    if 'straight' in matched_rtypes[0]:
+                        best_succ = sid_str
+                        min_delta_succ = -1.0
                 else:
                     if min_delta_succ == -1.0: continue
                     
                     is_same_way = any(e_id in succ_osmids for e_id in ego_osmids)
-                    threshold = 60.0 if is_same_way else 45.0
+                    threshold = config["angle_same_way_thresh"] if is_same_way else config["angle_diff_way_thresh"]
                     
                     if abs(delta_theta) <= threshold and abs(delta_theta) < min_delta_succ:
                         min_delta_succ = abs(delta_theta)
@@ -466,75 +467,93 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
                         only_targets_pred[p_id][t_id] = rtype
                         
         potential_predecessors = edges_by_v.get(u_node, [])
-        for pred_id in potential_predecessors:
-            sid_str = str(pred_id)
-            if sid_str == ego_id: continue
-            
-            pred_osmids = parse_osmids(segment_data[sid_str]['osmid'])
-            pred_heading = segment_data[sid_str]['exit_heading']
-            delta_theta = (data['entry_heading'] - pred_heading + 180) % 360 - 180
-            
-            if -25 <= delta_theta <= 25: direction = 'straight'
-            elif 25 < delta_theta < 170: direction = 'left'
-            elif -170 < delta_theta < -25: direction = 'right'
-            else: direction = 'u_turn'
-            
-            # Apply U-Turn Filters for Predecessors
-            if direction == 'u_turn':
-                is_same_way = any(p_id in ego_osmids for p_id in pred_osmids)
-                hw_type = segment_data[ego_id]['highway']
-                banned_hw = ['primary', 'secondary', 'trunk', 'motorway', 'primary_link', 'secondary_link', 'trunk_link', 'motorway_link']
-                is_banned_hw = hw_type in banned_hw
-                out_degree = len(edges_by_u.get(u_node, []))
-                in_degree = len(potential_predecessors)
-                is_mid_block = (out_degree <= 2 and in_degree <= 2)
+        non_link_preds = [p for p in potential_predecessors if not segment_data[str(p)]['highway'].endswith('_link')]
+        link_preds = [p for p in potential_predecessors if segment_data[str(p)]['highway'].endswith('_link')]
                 
-                if is_same_way or is_banned_hw or is_mid_block:
-                    continue  # Invalid structural U-turn, ignore entirely
+        def evaluate_predecessors(preds_list):
+            b_pred = None
+            m_delta = float('inf')
+            for pred_id in preds_list:
+                sid_str = str(pred_id)
+                if sid_str == ego_id: continue
+                
+                pred_osmids = parse_osmids(segment_data[sid_str]['osmid'])
+                pred_heading = segment_data[sid_str]['exit_heading']
+                delta_theta = (data['entry_heading'] - pred_heading + 180) % 360 - 180
+                
+                if -config["angle_straight_thresh"] <= delta_theta <= config["angle_straight_thresh"]: direction = 'straight'
+                elif config["angle_straight_thresh"] < delta_theta <= config["angle_left_right_limit_basic"]: direction = 'left'
+                elif -config["angle_left_right_limit_basic"] <= delta_theta < -config["angle_straight_thresh"]: direction = 'right'
+                elif config["angle_u_turn_thresh"] <= abs(delta_theta) <= 180: direction = 'u_turn'
+                else: continue
+                
+                if direction != 'u_turn' and abs(delta_theta) > config["angle_pred_limit"]:
+                    continue
+                
+                # Apply U-Turn Filters for Predecessors
+                if direction == 'u_turn':
+                    is_same_way = any(p_id in ego_osmids for p_id in pred_osmids)
+                    hw_type = segment_data[ego_id]['highway']
+                    banned_hw = config["banned_u_turn_hw_types"]
+                    is_banned_hw = hw_type in banned_hw
+                    out_degree = len(edges_by_u.get(u_node, []))
+                    in_degree = len(potential_predecessors)
+                    is_mid_block = (out_degree <= 2 and in_degree <= 2)
+                    
+                    if is_same_way or is_banned_hw or is_mid_block:
+                        continue  # Invalid structural U-turn, ignore entirely
 
-            # Check Turn Restrictions
-            is_banned = False
-            is_only = False
+                # Check Turn Restrictions
+                is_banned = False
+                is_only = False
+                
+                targets = only_targets_pred.get(sid_str, {})
+                if targets:
+                    target_sids_pred = [str(p) for p in edges_by_u.get(u_node, []) if any(tid in parse_osmids(segment_data[str(p)]['osmid']) for tid in targets.keys())]
+                    if not target_sids_pred:
+                        targets = {}
+                        
+                if targets:
+                    if any(e_id in targets for e_id in ego_osmids):
+                        is_only = True
+                        matched_rtypes = [targets[e_id] for e_id in ego_osmids if e_id in targets]
+                        turn_restrictions_logger.info(f"Ego [{ego_id}]: Mandatory transition from predecessor segment {sid_str} confirmed ({matched_rtypes[0]}).")
+                    else:
+                        is_banned = True
+                        rtypes = list(set(targets.values()))
+                        turn_restrictions_logger.info(f"Ego [{ego_id}] ({ego_osmids}): Predecessor segment {sid_str} filtered out (Only restriction {rtypes} points to segment(s) {target_sids_pred}).")
+                        
+                if not is_banned and not is_only:
+                    for p_id in pred_osmids:
+                        for e_id in ego_osmids:
+                            for (f_id, t_id, rtype) in banned_transitions:
+                                if f_id == p_id and t_id == e_id:
+                                    if direction in rtype:
+                                        is_banned = True
+                                        turn_restrictions_logger.info(f"Ego [{ego_id}] ({ego_osmids}): Banned connection from predecessor segment {sid_str} removed by spatial filter ({rtype} explicitly matched {direction}).")
+                                        
+                if is_banned:
+                    continue
+                
+                is_same_way = any(p_id in ego_osmids for p_id in pred_osmids)
+                threshold = config["angle_same_way_thresh"] if is_same_way else config["angle_diff_way_thresh"]
+                
+                if is_only:
+                    if 'straight' in matched_rtypes[0]:
+                        m_delta = -1.0
+                        b_pred = sid_str
+                        break
+                    else:
+                        continue
+                
+                if abs(delta_theta) <= threshold and abs(delta_theta) < m_delta:
+                    m_delta = abs(delta_theta)
+                    b_pred = sid_str
+            return b_pred, m_delta
             
-            targets = only_targets_pred.get(sid_str, {})
-            if targets:
-                target_sids_pred = [str(p) for p in edges_by_u.get(u_node, []) if any(tid in parse_osmids(segment_data[str(p)]['osmid']) for tid in targets.keys())]
-                if not target_sids_pred:
-                    targets = {}
-                    
-            if targets:
-                if any(e_id in targets for e_id in ego_osmids):
-                    is_only = True
-                    matched_rtypes = [targets[e_id] for e_id in ego_osmids if e_id in targets]
-                    turn_restrictions_logger.info(f"Ego [{ego_id}]: Mandatory transition from predecessor segment {sid_str} confirmed ({matched_rtypes[0]}).")
-                else:
-                    is_banned = True
-                    rtypes = list(set(targets.values()))
-                    turn_restrictions_logger.info(f"Ego [{ego_id}] ({ego_osmids}): Predecessor segment {sid_str} filtered out (Only restriction {rtypes} points to segment(s) {target_sids_pred}).")
-                    
-            if not is_banned and not is_only:
-                for p_id in pred_osmids:
-                    for e_id in ego_osmids:
-                        for (f_id, t_id, rtype) in banned_transitions:
-                            if f_id == p_id and t_id == e_id:
-                                if direction in rtype:
-                                    is_banned = True
-                                    turn_restrictions_logger.info(f"Ego [{ego_id}] ({ego_osmids}): Banned connection from predecessor segment {sid_str} removed by spatial filter ({rtype} explicitly matched {direction}).")
-                                    
-            if is_banned:
-                continue
-            
-            is_same_way = any(p_id in ego_osmids for p_id in pred_osmids)
-            threshold = 60.0 if is_same_way else 45.0
-            
-            if is_only:
-                min_delta_pred = -1.0
-                best_pred = sid_str
-                break
-            
-            if abs(delta_theta) <= threshold and abs(delta_theta) < min_delta_pred:
-                min_delta_pred = abs(delta_theta)
-                best_pred = sid_str
+        best_pred, min_delta_pred = evaluate_predecessors(non_link_preds)
+        if not best_pred:
+            best_pred, min_delta_pred = evaluate_predecessors(link_preds)
                 
         best_immediate[ego_id] = {
             'successor': best_succ, 
@@ -545,14 +564,14 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             'u_turn_successors': u_turn_successors
         }
 
-    logger.info(f"Chaining segments to reach {target_dist}m...")
+    logger.info(f"Chaining segments to reach {config['target_dist']}m...")
     for ego_id in segment_data.keys():
         # Build Successor Chain
         succ_chain = []
         merging_into = []
         curr_dist = 0.0
         curr_id = ego_id
-        while curr_dist < target_dist:
+        while curr_dist < config["target_dist"]:
             next_id = best_immediate[curr_id]['successor']
             if not next_id or next_id in succ_chain or next_id == ego_id:
                 break
@@ -573,7 +592,7 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
         pred_chain = []
         curr_dist = 0.0
         curr_id = ego_id
-        while curr_dist < target_dist:
+        while curr_dist < config["target_dist"]:
             prev_id = best_immediate[curr_id]['predecessor']
             if not prev_id or prev_id in pred_chain or prev_id == ego_id:
                 break
@@ -616,7 +635,7 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
                     filtered_intersects_in.append(sid)
         
         if only_successors:
-            filtered_intersects_out = [] # Mandatory transition strips away all other intersection choices.
+            filtered_intersects_out = [str(sid) for sid in only_successors if str(sid) != immediate_succ and str(sid) not in opposite_direction and str(sid) not in u_turns and str(sid) not in merging_into]
         else:
             filtered_intersects_out = [str(sid) for sid in valid_successors if str(sid) != immediate_succ and str(sid) not in opposite_direction and str(sid) not in u_turns and str(sid) not in merging_into]
 
@@ -649,81 +668,697 @@ def build_topological_adjacency(edges_gdf, target_dist=55.0):
             'opposite_direction_lengths': [segment_data[sid]['length'] for sid in opposite_direction]
         }
         
-    return adjacency
+    logger.info("Applying post-processing transition rules for junction links...")
+    for ego_id, data in adjacency.items():
+        turns_into = data.get('turns_into', [])
+        for L in turns_into:
+            if segment_data[L]['highway'].endswith('_link'):
+                M_list = adjacency.get(L, {}).get('merges_into', []) + adjacency.get(L, {}).get('turns_into', [])
+                if not M_list: continue
+                
+                M_names = [segment_data[m].get('name') for m in M_list if segment_data[m].get('name')]
+                if not M_names: continue
+                M_headings = [segment_data[m]['entry_heading'] for m in M_list]
+                
+                succs = data.get('to', [])[:3]
+                for S_i in succs:
+                    if S_i not in adjacency: continue
+                    S_i_turns = adjacency[S_i].get('turns_into', [])
+                    
+                    T_to_remove = []
+                    for T in S_i_turns:
+                        T_name = segment_data[T].get('name')
+                        if T_name in M_names:
+                            T_heading = segment_data[T]['entry_heading']
+                            # Check if direction is roughly the same as any M (i.e. not the opposite side of the road)
+                            is_same_dir = any(abs((T_heading - m_h + 180) % 360 - 180) < config["angle_parallel_thresh"] for m_h in M_headings)
+                            if is_same_dir:
+                                T_to_remove.append(T)
+                                
+                    for T in T_to_remove:
+                        if T in adjacency[S_i]['turns_into']:
+                            idx = adjacency[S_i]['turns_into'].index(T)
+                            adjacency[S_i]['turns_into'].pop(idx)
+                            adjacency[S_i]['turns_into_lengths'].pop(idx)
+                            
+                            # Clean up crosses and crossed_by lists that were built assuming S_i turns into T
+                            crosses_to_remove = [
+                                b_str for b_str in adjacency[S_i].get('crosses', [])
+                                if best_immediate.get(b_str, {}).get('successor') == T
+                            ]
+                            for b_str in crosses_to_remove:
+                                if b_str in adjacency[S_i]['crosses']:
+                                    c_idx = adjacency[S_i]['crosses'].index(b_str)
+                                    adjacency[S_i]['crosses'].pop(c_idx)
+                                    adjacency[S_i]['crosses_lengths'].pop(c_idx)
+                                    
+                                if b_str in adjacency and S_i in adjacency[b_str].get('crossed_by', []):
+                                    cb_idx = adjacency[b_str]['crossed_by'].index(S_i)
+                                    adjacency[b_str]['crossed_by'].pop(cb_idx)
+                                    adjacency[b_str]['crossed_by_lengths'].pop(cb_idx)
+                                    
+                            junctions_logger.info(f"Post-processing: Removed redundant turn {T} from {S_i} (parallels _link {L} merge/turn). Updated cross relations.")
 
-def merge_short_segments(gdf, adj, threshold=15.0):
-    logger.info(f"Merging segments shorter than {threshold}m into their neighbors to fill gaps...")
+    return adjacency, restrictions
+
+def merge_short_segments(gdf, adj, config):
+    logger.info(f"Merging standalone junction links into their neighbors...")
     gdf = gdf.copy()
     gdf.set_index('segment_id', inplace=True, drop=False)
     
-    redirect = {}
-    def get_target(t):
-        while t in redirect:
-            t = redirect[t]
-        return t
-
-    small_segments = gdf[gdf['length'] < threshold].index.tolist()
+    junction_sids = set(gdf[gdf['is_internal_junction'].astype(str).str.lower() == 'true'].index.astype(str))
     deleted = set()
     
-    for s_id in small_segments:
+    for s_id in junction_sids:
         if s_id in deleted: continue
-        if gdf.at[s_id, 'length'] >= threshold: continue
+            
+        is_shape = str(gdf.at[s_id, 'is_shape_junction']).lower() == 'true'
+        is_semantic = str(gdf.at[s_id, 'is_semantic_junction']).lower() == 'true'
+        
+        if is_shape or is_semantic:
+            continue
             
         s_adj = adj.get(str(s_id))
         if not s_adj: continue
             
-        t_id_original = s_adj['to'][0] if s_adj.get('to') else (s_adj['from'][0] if s_adj.get('from') else None)
-        is_succ = bool(s_adj.get('to'))
+        connected_sids = set()
+        for rel in ['turns_into', 'merges_into', 'u_turns_into', 'crosses', 'crossed_by']:
+            connected_sids.update(s_adj.get(rel, []))
             
-        if not t_id_original: continue
+        if s_adj.get('to'):
+            connected_sids.add(str(s_adj.get('to')[0]))
+        if s_adj.get('from'):
+            connected_sids.add(str(s_adj.get('from')[0]))
             
-        t_id = get_target(t_id_original)
-        if t_id == s_id or t_id not in gdf.index: continue
+        if connected_sids.intersection(junction_sids):
+            continue
+       
             
-        s_row, t_row = gdf.loc[s_id], gdf.loc[t_id]
+            
+        S_list = s_adj.get('to', [])
+        P_list = s_adj.get('from', [])
+        
+        S = str(S_list[0]) if S_list else None
+        P = str(P_list[0]) if P_list else None
+
+        S_valid = False
+        if S and P:
+            S_adj = adj.get(S, {})
+            S_from = S_adj.get('from', [])
+            S_from_0 = str(S_from[0]) if S_from else None
+            if S_from_0 == P and not s_adj.get('crossed_by') and not s_adj.get('turns_into'):
+                S_valid = True
+                
+        P_valid = False
+        if P and S:
+            P_adj = adj.get(P, {})
+            P_to = P_adj.get('to', [])
+            P_to_0 = str(P_to[0]) if P_to else None
+            if P_to_0 == S and not P_adj.get('turns_into') and not P_adj.get('crossed_by'):
+                P_valid = True
+                
+        if not S_valid and not P_valid:
+            continue
+            
+        geom_J = gdf.loc[s_id, 'geometry']
+        delta_S = float('inf')
+        delta_P = float('inf')
+        
+        if S and S in gdf.index:
+            geom_S = gdf.loc[S, 'geometry']
+            delta_S = abs((get_smoothed_heading(geom_S, reverse=True, look_dist=config["heading_look_dist"]) - get_smoothed_heading(geom_J, reverse=False, look_dist=config["heading_look_dist"]) + 180) % 360 - 180)
+        if P and P in gdf.index:
+            geom_P = gdf.loc[P, 'geometry']
+            delta_P = abs((get_smoothed_heading(geom_J, reverse=True, look_dist=config["heading_look_dist"]) - get_smoothed_heading(geom_P, reverse=False, look_dist=config["heading_look_dist"]) + 180) % 360 - 180)
+            
+        target_id = None
+        is_succ = True
+        
+        if S_valid and P_valid:
+            if delta_S <= delta_P:
+                target_id = S
+                is_succ = True
+            else:
+                target_id = P
+                is_succ = False
+        elif S_valid:
+            target_id = S
+            is_succ = True
+        elif P_valid:
+            target_id = P
+            is_succ = False
+            
+        if not target_id or target_id == s_id or target_id not in gdf.index: 
+            continue
+            
+        s_row, t_row = gdf.loc[s_id], gdf.loc[target_id]
         
         if is_succ:
-            old_node, new_node = s_row['v'], s_row['u']
             s_coords, t_coords = list(s_row['geometry'].coords), list(t_row['geometry'].coords)
             new_coords = s_coords + t_coords[1:] if s_coords[-1] == t_coords[0] else s_coords + t_coords
         else:
-            old_node, new_node = s_row['u'], s_row['v']
             s_coords, t_coords = list(s_row['geometry'].coords), list(t_row['geometry'].coords)
             new_coords = t_coords + s_coords[1:] if t_coords[-1] == s_coords[0] else t_coords + s_coords
                 
         merged_geom = LineString(new_coords)
-        gdf.at[t_id, 'geometry'] = merged_geom
-        gdf.at[t_id, 'length'] = merged_geom.length
-        
-        gdf.loc[gdf['u'] == old_node, 'u'] = new_node
-        gdf.loc[gdf['v'] == old_node, 'v'] = new_node
+        gdf.at[target_id, 'geometry'] = merged_geom
+        gdf.at[target_id, 'length'] = merged_geom.length
         
         deleted.add(s_id)
-        redirect[s_id] = t_id
+        if str(s_id) in adj:
+            del adj[str(s_id)]
+        logger.info(f"Merged junction link {s_id} into {'successor' if is_succ else 'predecessor'} segment {target_id}. Updated geometry only.")
         
-    logger.info(f"Absorbed {len(deleted)} short segments into neighbors.")
+    logger.info(f"Absorbed {len(deleted)} standalone junction links into neighbors.")
     gdf = gdf[~gdf.index.isin(deleted)].copy()
     gdf.reset_index(drop=True, inplace=True)
-    gdf['segment_id'] = gdf.index.astype(str)
     return gdf
+
+def classify_junctions(edges_gdf, config):
+    from shapely.ops import polygonize
+    max_area_sqm = config["classify_max_area_sqm"]
+    max_length_m = config["classify_max_length_m"]
+    junctions_logger.info(f"Classifying junctions (max area: {max_area_sqm} sqm, max length: {max_length_m}m)...")
+
+    # Deduplicate by undirected endpoint pair: two-way roads produce two directed
+    # edges with overlapping reversed geometry, which blocks polygonize from closing
+    # shapes that include a two-way segment.
+    seen_pairs = set()
+    unique_geoms = []
+    for u, v, geom in zip(edges_gdf['u'], edges_gdf['v'], edges_gdf.geometry):
+        key = frozenset((u, v))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        unique_geoms.append(geom)
+
+    # Use spatial properties of the lines to find closed shapes
+    polygons = list(polygonize(unique_geoms))
+    
+    # Filter polygons by area threshold
+    junction_polys = [poly for poly in polygons if poly.area <= max_area_sqm]
+    
+    junction_edges_idx = set()
+    
+    # Condition 1: Short edges
+    short_edges = set(edges_gdf[edges_gdf['length'] <= max_length_m].index)
+    junction_edges_idx.update(short_edges)
+    
+    # Condition 2: Edges forming small shapes
+    shape_edges = set()
+    if junction_polys:
+        sindex = edges_gdf.sindex
+        for poly in junction_polys:
+            bound = poly.boundary
+            possible_matches_index = list(sindex.intersection(bound.bounds))
+            poly_edge_indices = []
+            for idx in possible_matches_index:
+                row = edges_gdf.iloc[idx]
+                geom = row.geometry
+                # Only select edges that make up the boundary (intersection length > 0),
+                # ignoring external edges that just touch the boundary at a vertex.
+                if geom.intersection(bound).length > config["classify_min_intersection_length"]:
+                    if row['length'] <= config["classify_shape_max_length_m"]:
+                        poly_edge_indices.append(idx)
+            shape_edges.update(poly_edge_indices)
+            junction_edges_idx.update(poly_edge_indices)
+
+    # Condition 3: Semantic tags (OSM junction=* tag)
+    if 'junction' in edges_gdf.columns:
+        semantic_edges = set(edges_gdf[~edges_gdf['junction'].isin(['none', 'nan', 'no', '', 'null', '<na>'])].index)
+        junction_edges_idx.update(semantic_edges)
+    else:
+        semantic_edges = set()
+
+    edges_gdf['is_internal_junction'] = 'False'
+    edges_gdf.loc[list(junction_edges_idx), 'is_internal_junction'] = 'True'
+    
+    edges_gdf['is_shape_junction'] = 'False'
+    edges_gdf.loc[list(shape_edges), 'is_shape_junction'] = 'True'
+    
+    edges_gdf['is_semantic_junction'] = 'False'
+    edges_gdf.loc[list(semantic_edges), 'is_semantic_junction'] = 'True'
+    
+    num_total = len(junction_edges_idx)
+    num_short = len(short_edges)
+    num_semantic = len(semantic_edges)
+    num_shape_only = num_total - len(short_edges.union(semantic_edges))
+    
+    junctions_logger.info(f"Classified {num_total} edges as junctions ({num_semantic} from semantic tags, {num_shape_only} purely from shapes, and {num_short} from length).")
+    
+    return edges_gdf
+
+def propagate_junction_topology(adjacency, edges_gdf, restrictions, config):
+    """
+    Step 7 of the pipeline.
+
+    After classify_junctions has flagged edges belonging to the internal
+    geometry of a junction, rewire the topology so that external road
+    segments connect directly to the segments on the far side of the
+    junction, bypassing the chain of internal junction links.
+
+    Rules
+    -----
+    * Junction links may stack ('to' -> 'to', 'turns_into' -> 'to', or
+      'merges_into' -> 'to', even forming circular roundabouts), so the
+      chain is searched consecutively until a non-junction segment is
+      reached.
+    * If every hop in the chain is a 'to' continuation, the ego is
+      connected 'to' the final external segment (preserving through-
+      movement). Otherwise the relationship is classified by the
+      geometric heading delta between ego and the external target:
+      straight + merge-hop -> merges_into, left/right -> turns_into,
+      reversed -> u_turns_into.
+    * Way-based turn restrictions (OSM relations with one or more via
+      ways) are honored: a chain whose traversed ways match the via list
+      of a 'no_*' restriction is dropped, and an 'only_*' restriction
+      forces the ego to keep only chains that land on the mandated
+      target.
+    * crosses and crossed_by are recomputed for every affected
+      non-junction segment using the union of the junction footprint
+      nodes as the conceptual intersection.
+    """
+    junctions_logger.info("Propagating topology through classified junction links...")
+
+    junction_set = set(
+        edges_gdf.loc[edges_gdf['is_internal_junction'] == 'True', 'segment_id']
+        .astype(str)
+        .tolist()
+    )
+    if not junction_set:
+        junctions_logger.info("No junction links classified; skipping propagation.")
+        return adjacency
+
+    # Rebuild lightweight per-segment metadata. segment_ids may have been
+    # reissued by merge_short_segments, so we always derive from edges_gdf.
+    segment_data = {}
+    for _, row in edges_gdf.iterrows():
+        sid = str(row['segment_id'])
+        geom = row['geometry']
+        name_val = row['name'] if 'name' in row else ''
+        segment_data[sid] = {
+            'u': row['u'],
+            'v': row['v'],
+            'osmid': str(row['osmid']),
+            'highway': str(row['highway']),
+            'name': get_first_hw(name_val),
+            'length': float(row['length']),
+            'exit_heading': get_smoothed_heading(geom, reverse=False, look_dist=config["heading_look_dist"]),
+            'entry_heading': get_smoothed_heading(geom, reverse=True, look_dist=config["heading_look_dist"]),
+        }
+
+    edges_by_u = edges_gdf.groupby('u')['segment_id'].apply(list).to_dict()
+    edges_by_v = edges_gdf.groupby('v')['segment_id'].apply(list).to_dict()
+
+    # Split ALL restrictions into banned / mandatory tables for junction propagation.
+    banned_rels = []  # (from_way, [via_ways], to_way, rtype)
+    only_rels = []
+    for r in restrictions:
+        vias = r.get('via_ways') or [] 
+        rtype = r.get('type', '')
+        if rtype.startswith('no_'):
+            banned_rels.append((r['from'], list(vias), r['to'], rtype))
+        elif rtype.startswith('only_'):
+            only_rels.append((r['from'], list(vias), r['to'], rtype))
+
+    OUT_RELS = ('to', 'turns_into', 'merges_into', 'u_turns_into')
+    LEN_KEY = {
+        'to': 'to_lengths',
+        'turns_into': 'turns_into_lengths',
+        'merges_into': 'merges_into_lengths',
+        'u_turns_into': 'u_turns_into_lengths',
+    }
+
+    def classify_direction(ego_id, tgt_id):
+        delta = (segment_data[tgt_id]['entry_heading']
+                 - segment_data[ego_id]['exit_heading'] + 180) % 360 - 180
+        if -config["angle_straight_thresh"] <= delta <= config["angle_straight_thresh"]:
+            return 'straight'
+        if config["angle_straight_thresh"] < delta < config["angle_left_right_limit_propagate"]:
+            return 'left'
+        if -config["angle_left_right_limit_propagate"] < delta < -config["angle_straight_thresh"]:
+            return 'right'
+        if config["angle_u_turn_thresh"] <= abs(delta) <= 180:
+            return 'u_turn'
+        return 'straight'
+
+    def follow_junction_chain(j_seed, visited=None, depth=0, max_depth=None):
+        if max_depth is None:
+            max_depth = config["junction_max_depth"]
+        """
+        Starting from a junction link j_seed, walk through every outgoing
+        relation (to / turns_into / merges_into / u_turns_into) until a
+        non-junction segment is reached.
+
+        Returns a list of (exit_segment_id, full_chain, chain_rels) tuples
+        where chain_rels is the sequence of relation keys traversed
+        (one shorter than full_chain; empty if the first hop already
+        exits the junction).
+        """
+        if visited is None:
+            visited = set()
+        if j_seed in visited or depth > max_depth or j_seed not in adjacency:
+            return []
+        visited = visited | {j_seed}
+        results = []
+        for relkey in OUT_RELS:
+            neighbors = adjacency[j_seed].get(relkey, [])
+            if relkey == 'to' and neighbors:
+                neighbors = [neighbors[0]]
+            for nxt in neighbors:
+                if nxt in junction_set:
+                    for tgt, chain, rels in follow_junction_chain(
+                            nxt, visited, depth + 1, max_depth):
+                        results.append((tgt, [j_seed] + chain, [relkey] + rels))
+                else:
+                    if nxt in adjacency:
+                        results.append((nxt, [j_seed], [relkey]))
+        return results
+
+
+    # Gather new connections before mutating adjacency.
+    additions = {}  # ego_id -> list of (tgt, new_rel, chain)
+    for ego_id, adj in adjacency.items():
+        if ego_id in junction_set:
+            continue
+        ego_osmids = parse_osmids(segment_data[ego_id]['osmid'])
+        ego_osmids_set = set(ego_osmids)
+        additions.setdefault(ego_id, [])
+
+        for entry_rel in OUT_RELS:
+            neighbors = adj.get(entry_rel, [])
+            if entry_rel == 'to' and neighbors:
+                neighbors = [neighbors[0]]
+            for j in list(neighbors):
+                if j not in junction_set:
+                    continue
+                for tgt, chain, chain_rels in follow_junction_chain(j):
+                    if tgt == ego_id:
+                        continue
+
+                    chain_way_sets = [
+                        set(parse_osmids(segment_data[c]['osmid'])) for c in chain
+                    ]
+                    tgt_osmids_set = set(parse_osmids(segment_data[tgt]['osmid']))
+                    
+                    path_way_sets = [ego_osmids_set] + chain_way_sets + [tgt_osmids_set]
+                    
+                    banned = False
+                    forced_turn = False
+                    
+                    # Check only_* restrictions
+                    for (f_id, vias, t_id, rtype) in only_rels:
+                        seq = [f_id] + vias
+                        curr_idx = -1
+                        found_seq = True
+                        for wid in seq:
+                            found = False
+                            for i in range(curr_idx + 1, len(path_way_sets)):
+                                if wid in path_way_sets[i]:
+                                    curr_idx = i
+                                    found = True
+                                    break
+                            if not found:
+                                found_seq = False
+                                break
+                                
+                        if found_seq:
+                            last_seq_wid = seq[-1]
+                            violation = False
+                            obeyed = False
+                            for i in range(curr_idx + 1, len(path_way_sets)):
+                                if last_seq_wid in path_way_sets[i]:
+                                    continue
+                                if t_id in path_way_sets[i]:
+                                    obeyed = True
+                                    break # Obeyed
+                                else:
+                                    violation = True
+                                    break
+                            
+                            if violation:
+                                turn_restrictions_logger.info(
+                                    f"Junction propagation: [{ego_id}] -> [{tgt}] via {chain} "
+                                    f"dropped by ONLY restriction ({rtype}) from {f_id} requiring {t_id}.")
+                                banned = True
+                                break
+                            elif obeyed:
+                                if 'straight' not in rtype:
+                                    forced_turn = True
+                                
+                    if banned:
+                        continue
+
+                    # Check no_* restrictions
+                    for (f_id, vias, t_id, rtype) in banned_rels:
+                        seq = [f_id] + vias + [t_id]
+                        curr_idx = -1
+                        found_seq = True
+                        for wid in seq:
+                            found = False
+                            for i in range(curr_idx + 1, len(path_way_sets)):
+                                if wid in path_way_sets[i]:
+                                    curr_idx = i
+                                    found = True
+                                    break
+                            if not found:
+                                found_seq = False
+                                break
+                        if found_seq:
+                            turn_restrictions_logger.info(
+                                f"Junction propagation: [{ego_id}] -> [{tgt}] via {chain} "
+                                f"dropped by NO restriction ({rtype}).")
+                            banned = True
+                            break
+                                
+                    if banned:
+                        continue
+
+                    direction = classify_direction(ego_id, tgt)
+                    all_through = (entry_rel == 'to'
+                                   and all(r == 'to' for r in chain_rels))
+                    saw_merge = (entry_rel == 'merges_into'
+                                 or 'merges_into' in chain_rels)
+
+                    if direction == 'u_turn':
+                        is_same_way = any(e_id in tgt_osmids_set for e_id in ego_osmids)
+                        hw_type = segment_data[ego_id]['highway']
+                        banned_hw = config["banned_u_turn_hw_types"]
+                        is_banned_hw = hw_type in banned_hw
+                        
+                        v_node = segment_data[ego_id]['v']
+                        out_degree = len(edges_by_u.get(v_node, []))
+                        in_degree = len(edges_by_v.get(v_node, []))
+                        is_mid_block = (out_degree <= 2 and in_degree <= 2)
+                        
+                        if is_same_way or is_banned_hw or is_mid_block:
+                            junctions_logger.info(
+                                f"Junction propagation: [{ego_id}] -> [{tgt}] via {chain} "
+                                f"dropped by U-Turn Filters.")
+                            continue
+                            
+                        new_rel = 'u_turns_into'
+                    elif forced_turn:
+                        new_rel = 'turns_into'
+                    elif direction == 'straight' and all_through and not saw_merge:
+                        new_rel = 'to'
+                    elif direction == 'straight' and saw_merge:
+                        new_rel = 'merges_into'
+                    else:
+                        new_rel = 'turns_into'
+
+                    additions[ego_id].append((tgt, new_rel, chain))
+                    junctions_logger.info(
+                        f"Junction bypass: [{ego_id}] -{new_rel}-> [{tgt}] via {chain}.")
+
+    # Apply: drop junction-link references from non-junction segments, then add new ones.
+    for ego_id in adjacency.keys():
+        if ego_id in junction_set:
+            continue
+        for relkey in OUT_RELS:
+            old_list = adjacency[ego_id].get(relkey, [])
+            old_lens = adjacency[ego_id].get(LEN_KEY[relkey], [])
+            kept = [(t, l) for t, l in zip(old_list, old_lens) if t not in junction_set]
+            adjacency[ego_id][relkey] = [t for t, _ in kept]
+            adjacency[ego_id][LEN_KEY[relkey]] = [l for _, l in kept]
+        old_from = adjacency[ego_id].get('from', [])
+        old_from_lens = adjacency[ego_id].get('from_lengths', [])
+        kept_from = [(f, l) for f, l in zip(old_from, old_from_lens) if f not in junction_set]
+        adjacency[ego_id]['from'] = [f for f, _ in kept_from]
+        adjacency[ego_id]['from_lengths'] = [l for _, l in kept_from]
+
+    for ego_id, conns in additions.items():
+        seen = set()
+        for tgt, new_rel, _chain in conns:
+            key = (tgt, new_rel)
+            if key in seen:
+                continue
+            seen.add(key)
+            if tgt in adjacency[ego_id][new_rel]:
+                continue
+            adjacency[ego_id][new_rel].append(tgt)
+            adjacency[ego_id][LEN_KEY[new_rel]].append(segment_data[tgt]['length'])
+            # Reciprocal 'from' chain for straight through-connections.
+            if new_rel == 'to' and tgt in adjacency:
+                if ego_id not in adjacency[tgt].get('from', []):
+                    adjacency[tgt].setdefault('from', []).append(ego_id)
+                    adjacency[tgt].setdefault('from_lengths', []).append(
+                        segment_data[ego_id]['length'])
+
+    # ---- Recompute crosses / crossed_by using the expanded junction footprint ----
+    junctions_logger.info("Recomputing crosses/crossed_by after junction propagation...")
+
+    nonjunc_ids = [sid for sid in adjacency.keys() if sid not in junction_set]
+
+    enters_node = {}
+    for sid in nonjunc_ids:
+        v = segment_data[sid]['v']
+        enters_node.setdefault(v, set()).add(sid)
+
+    def junction_footprint(ego_id):
+        """Nodes belonging to the junction(s) downstream of ego (inclusive of ego_v)."""
+        nodes = {segment_data[ego_id]['v']}
+        seen_junc = set()
+        stack = []
+        for relkey in OUT_RELS:
+            neighbors = adjacency[ego_id].get(relkey, [])
+            if relkey == 'to' and neighbors:
+                neighbors = [neighbors[0]]
+            for nxt in neighbors:
+                if nxt in junction_set:
+                    stack.append(nxt)
+        while stack:
+            j = stack.pop()
+            if j in seen_junc:
+                continue
+            seen_junc.add(j)
+            nodes.add(segment_data[j]['u'])
+            nodes.add(segment_data[j]['v'])
+            for relkey in OUT_RELS:
+                neighbors = adjacency[j].get(relkey, [])
+                if relkey == 'to' and neighbors:
+                    neighbors = [neighbors[0]]
+                for nxt in neighbors:
+                    if nxt in junction_set and nxt not in seen_junc:
+                        stack.append(nxt)
+        return nodes
+
+    for ego_id in nonjunc_ids:
+        adj = adjacency[ego_id]
+        turn_targets = (set(adj.get('turns_into', []))
+                        | set(adj.get('merges_into', []))
+                        | set(adj.get('u_turns_into', [])))
+        through_target = set(adj.get('to', [])[:1])
+        opposite = set(adj.get('opposite_direction', []))
+
+        candidates = set()
+        for n in junction_footprint(ego_id):
+            candidates |= enters_node.get(n, set())
+        candidates.discard(ego_id)
+        candidates -= opposite
+
+        crossed_by = []
+        crosses = []
+        for b in candidates:
+            b_adj = adjacency[b]
+            b_outs = set()
+            for rk in OUT_RELS:
+                b_outs |= set(b_adj.get(rk, []))
+            if b_outs & turn_targets:
+                if b not in crosses:
+                    crosses.append(b)
+            if (ego_id in b_outs) or (b_outs & turn_targets) or (b_outs & through_target):
+                if b not in crossed_by:
+                    crossed_by.append(b)
+
+        adjacency[ego_id]['crossed_by'] = crossed_by
+        adjacency[ego_id]['crossed_by_lengths'] = [
+            segment_data[b]['length'] for b in crossed_by
+        ]
+        adjacency[ego_id]['crosses'] = crosses
+        adjacency[ego_id]['crosses_lengths'] = [
+            segment_data[b]['length'] for b in crosses
+        ]
+        
+    # ---- Additional Topological Check for crosses / crossed_by ----
+    for ego_id in nonjunc_ids:
+        targets = adjacency[ego_id].get('turns_into', []) + adjacency[ego_id].get('u_turns_into', []) + adjacency[ego_id].get('merges_into', [])
+        for tgt in targets:
+            from_list = adjacency.get(tgt, {}).get('from', [])
+            if from_list:
+                from_id = from_list[0]
+                if from_id != ego_id and from_id in nonjunc_ids:
+                    if from_id not in adjacency[ego_id]['crosses']:
+                        adjacency[ego_id]['crosses'].append(from_id)
+                        adjacency[ego_id]['crosses_lengths'].append(segment_data[from_id]['length'])
+                    if ego_id not in adjacency[from_id]['crossed_by']:
+                        adjacency[from_id]['crossed_by'].append(ego_id)
+                        adjacency[from_id]['crossed_by_lengths'].append(segment_data[ego_id]['length'])
+
+    junctions_logger.info(
+        f"Junction propagation complete: rewired {sum(len(v) for v in additions.values())} "
+        f"connections across {len(junction_set)} junction links.")
+
+    return adjacency
+
 
 def main():
     parser = argparse.ArgumentParser(description="Build robust topological adjacency. Always downloads the latest network.")
     parser.add_argument('--output', default='topological_adjacency.json', help="Output JSON filename.")
     parser.add_argument('--bbox', type=float, nargs=4, default=[23.71317, 37.97161, 23.74515, 37.99880], help="Bounding box coordinates in the order: west south east north (left bottom right top)")
+    parser.add_argument('--merge-short', action='store_true', help="Enable merging of segments shorter than 15m to fill gaps")
     args = parser.parse_args()
     
+    config = {
+        "valid_highway_types": [
+            'primary', 'secondary', 'tertiary', 'trunk', 'residential', 
+            'unclassified', 'living_street', 'road', 'primary_link', 
+            'secondary_link', 'tertiary_link', 'trunk_link', 'motorway', 
+            'motorway_link'
+        ],
+        "lane_prop_iterations": 10,
+        "heading_look_dist": 10.0,
+        "overpass_buffer": 0.001,
+        "overpass_timeout": 40,
+        "turn_restrictions_path": "turn_restrictions.json",
+        "target_dist": 55.0,
+        "angle_straight_thresh": 25,
+        "angle_u_turn_thresh": 170,
+        "angle_pred_limit": 75,
+        "angle_same_way_thresh": 60.0,
+        "angle_diff_way_thresh": 45.0,
+        "angle_parallel_thresh": 60.0,
+        "angle_left_right_limit_basic": 120,
+        "angle_left_right_limit_propagate": 170,
+        "banned_u_turn_hw_types": [
+            'primary', 'secondary', 'trunk', 'motorway', 
+            'primary_link', 'secondary_link', 'trunk_link', 'motorway_link'
+        ],
+        "classify_max_area_sqm": 300.0,
+        "classify_max_length_m": 18.0,
+        "classify_shape_max_length_m": 35.0,
+        "classify_min_intersection_length": 1e-5,
+        "junction_max_depth": 25,
+        "network_path": "osm_network.gpkg"
+    }
+    
     # Always download the network as requested
-    edges = get_osm_network(tuple(args.bbox))
+    edges = get_osm_network(tuple(args.bbox), config)
     
     # 1. Build initial adjacency to know who connects to who
-    adjacency = build_topological_adjacency(edges)
-    # # 2. Merge short segments to expand neighbors and fill gaps
-    # edges = merge_short_segments(edges, adjacency, threshold=15.0)
-    # # 3. Rebuild final clean adjacency
-    # adjacency = build_topological_adjacency(edges)
-    
-    network_path = "osm_network.gpkg"
+    adjacency, restrictions = build_topological_adjacency(edges, config)
+
+    edges = classify_junctions(edges, config)
+
+    # 2. Propagate topology through classified junction links so external segments
+    #    connect directly to the segments on the far side of the junction.
+    adjacency = propagate_junction_topology(adjacency, edges, restrictions, config)
+
+    if args.merge_short:
+        # 3. Merge standalone junction links
+        edges = merge_short_segments(edges, adjacency, config)
+
+    network_path = config["network_path"]
     logger.info(f"Saving final merged OSM network to {network_path}...")
     
     # GPKG cannot handle lists well. Convert any list-like osmid or highway tags to simple strings for saving.

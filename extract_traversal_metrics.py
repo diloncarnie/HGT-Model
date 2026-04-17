@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from scipy.interpolate import interp1d
+import geopandas as gpd
 import multiprocessing as mp
 import argparse
 import time
@@ -13,6 +13,10 @@ import logging
 
 # Suppress warnings if needed
 warnings.filterwarnings('ignore')
+
+CHAIN_CRITICAL_TAG = " [CHAIN - CRITICAL]"
+ROAD_TYPE_CRITICAL_TAG = " [PRIMARY/SECONDARY - CRITICAL]"
+PRIMARY_SECONDARY_TYPES = {'primary', 'secondary', 'primary_link', 'secondary_link'}
 
 def calculate_rtsm(temporal_speed, spatial_speed, temp_thresh, spat_thresh):
     if temp_thresh == -1.0 or spat_thresh == -1.0:
@@ -39,218 +43,307 @@ def calculate_rtsm(temporal_speed, spatial_speed, temp_thresh, spat_thresh):
     rtsm = distance / worst_case_distance
     return float(max(0.0, min(1.0, rtsm)))
 
+def _max_run_duration(mask_both, dt):
+    """Max sum of dt[i] over runs where mask_both[i] stays True."""
+    if not mask_both.any():
+        return 0.0
+    current = 0.0
+    mx = 0.0
+    for i in range(len(mask_both)):
+        if mask_both[i]:
+            current += dt[i]
+            if current > mx:
+                mx = current
+        else:
+            current = 0.0
+    return mx
+
+
+def _compute_chain_segment_ids(net_gdf):
+    """
+    Returns the set of segment_ids (as strings) that are interior chain segments:
+    both endpoints are shared with at least one other segment in the network.
+    A dead-end segment has at least one endpoint that no other segment touches.
+    """
+    from collections import defaultdict
+    node_to_segs = defaultdict(set)
+
+    for _, row in net_gdf.iterrows():
+        seg_id = str(row['segment_id'])
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            coords = list(geom.coords)
+        except Exception:
+            continue
+        if len(coords) < 2:
+            continue
+        start = (round(coords[0][0], 7), round(coords[0][1], 7))
+        end   = (round(coords[-1][0], 7), round(coords[-1][1], 7))
+        node_to_segs[start].add(seg_id)
+        node_to_segs[end].add(seg_id)
+
+    chain_ids = set()
+    for _, row in net_gdf.iterrows():
+        seg_id = str(row['segment_id'])
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            coords = list(geom.coords)
+        except Exception:
+            continue
+        if len(coords) < 2:
+            continue
+        start = (round(coords[0][0], 7), round(coords[0][1], 7))
+        end   = (round(coords[-1][0], 7), round(coords[-1][1], 7))
+        if len(node_to_segs[start]) > 1 and len(node_to_segs[end]) > 1:
+            chain_ids.add(seg_id)
+
+    return chain_ids
+
+
+def _compute_primary_secondary_ids(net_gdf):
+    """
+    Returns the set of segment_ids (as strings) whose highway tag is
+    primary, secondary, primary_link, or secondary_link.
+    """
+    if 'highway' not in net_gdf.columns or 'segment_id' not in net_gdf.columns:
+        return set()
+    mask = net_gdf['highway'].astype(str).str.lower().isin(PRIMARY_SECONDARY_TYPES)
+    return set(net_gdf.loc[mask, 'segment_id'].astype(str))
+
+
+def _new_segment_stat():
+    return {
+        'total': 0, 'invalid': 0, 'invalid_outlier_ratio': 0,
+        'invalid_outlier_stop': 0, 'invalid_gap': 0,
+        'invalid_monotonic': 0, 'invalid_bounds': 0, 'insufficient_records': 0,
+        'sum_outlier_ratio': 0.0, 'count_outlier_ratio': 0,
+        'sum_outlier_stop': 0.0, 'count_outlier_stop': 0
+    }
+
+
 def process_track(track_data, config):
-    """Processes all segments for a single track_id."""
+    """Processes all segments for a single track_id using numpy arrays."""
     track_id, track_df = track_data
-    
-    # Keep original index to update outliers later
+
+    track_df = track_df.copy()
     track_df['original_index'] = track_df.index
     track_df = track_df.sort_values('time').reset_index(drop=True)
-    
+
     traversals = []
     segment_stats = {}
     logs = []
     valid_original_indices = []
-    
-    # Identify segment transitions
-    segment_changes = track_df['segment_id'] != track_df['segment_id'].shift()
-    segment_groups = (segment_changes).cumsum()
-    
-    for group_id, group_df in track_df.groupby(segment_groups):
-        if len(group_df) == 0:
-            logs.append(f"Track {track_id} has an empty segment group (group_id={group_id}). Skipping.")
+
+    n = len(track_df)
+    if n == 0:
+        return traversals, segment_stats, logs, valid_original_indices
+
+    seg_ids = track_df['segment_id'].values
+    times_all = track_df['time'].values.astype(float)
+    speeds_all = track_df['speed'].values.astype(float)
+    tproj_all = track_df['t_proj'].values.astype(float)
+    seglen_all = track_df['segment_length'].values.astype(float)
+    orig_idx_all = track_df['original_index'].values
+    has_outlier_col = 'is_outlier' in track_df.columns
+    outlier_all = track_df['is_outlier'].values.astype(bool) if has_outlier_col else None
+
+    # Group boundaries on consecutive runs of same segment_id
+    change = np.empty(n, dtype=bool)
+    change[0] = True
+    if n > 1:
+        change[1:] = seg_ids[1:] != seg_ids[:-1]
+    boundaries = np.where(change)[0]
+    ends = np.append(boundaries[1:], n)
+
+    gap_thresh = config['gap_threshold']
+    stopped_thresh = config['stopped_speed_threshold']
+    max_outlier_prop = config.get('max_outlier_proportion', 0.2)
+    max_outlier_stop_dur = config.get('max_outlier_stop_duration', 5.0)
+    min_edge = config['min_edge_threshold']
+    max_edge = config['max_edge_threshold']
+    edge_prop = config['edge_prop_threshold']
+    mono_off = config['monotonicity_offset']
+    speed_int = config['speed_sample_interval']
+
+    for start, end in zip(boundaries, ends):
+        if end <= start:
             continue
-            
-        segment_id = group_df['segment_id'].iloc[0]
+        segment_id = seg_ids[start]
         if segment_id not in segment_stats:
-            segment_stats[segment_id] = {
-                'total': 0, 'invalid': 0, 'invalid_outlier_ratio': 0, 
-                'invalid_outlier_stop': 0, 'invalid_gap': 0, 
-                'invalid_monotonic': 0, 'invalid_bounds': 0, 'insufficient_records': 0,
-                'sum_outlier_ratio': 0.0, 'count_outlier_ratio': 0,
-                'sum_outlier_stop': 0.0, 'count_outlier_stop': 0
-            }
-        segment_stats[segment_id]['total'] += 1
-        
-        segment_length = group_df['segment_length'].iloc[0]
-        
-        # Outlier Traversal Check: Proportion-based & Kinematic-Gated rejection
-        if 'is_outlier' in group_df.columns:
-            outlier_ratio = group_df['is_outlier'].mean()
-            segment_stats[segment_id]['sum_outlier_ratio'] += float(outlier_ratio)
-            segment_stats[segment_id]['count_outlier_ratio'] += 1
-            
-            outlier_stopped_mask = group_df['is_outlier'] & (group_df['speed'] < config['stopped_speed_threshold'])
+            segment_stats[segment_id] = _new_segment_stat()
+        st = segment_stats[segment_id]
+        st['total'] += 1
+
+        segment_length = float(seglen_all[start])
+        g_times = times_all[start:end]
+        g_speeds = speeds_all[start:end]
+        g_tproj = tproj_all[start:end]
+        g_orig = orig_idx_all[start:end]
+        g_len = end - start
+
+        if has_outlier_col:
+            g_outlier = outlier_all[start:end]
+            outlier_ratio = float(g_outlier.mean())
+            st['sum_outlier_ratio'] += outlier_ratio
+            st['count_outlier_ratio'] += 1
+
+            stopped_mask = g_outlier & (g_speeds < stopped_thresh)
             max_outlier_stop = 0.0
-            if outlier_stopped_mask.any():
-                current_outlier_stop = 0.0
-                times = group_df['time'].values
-                mask_vals = outlier_stopped_mask.values
-                
-                for i in range(1, len(group_df)):
-                    if mask_vals[i] and mask_vals[i-1]:
-                        current_outlier_stop += times[i] - times[i-1]
-                    else:
-                        max_outlier_stop = max(max_outlier_stop, current_outlier_stop)
-                        current_outlier_stop = 0.0
-                max_outlier_stop = max(max_outlier_stop, current_outlier_stop)
-                
-                segment_stats[segment_id]['sum_outlier_stop'] += float(max_outlier_stop)
-                segment_stats[segment_id]['count_outlier_stop'] += 1
-                    
-            if outlier_ratio > config.get('max_outlier_proportion', 0.2):
-                segment_stats[segment_id]['invalid'] += 1
-                segment_stats[segment_id]['invalid_outlier_ratio'] += 1
+            if stopped_mask.any() and g_len > 1:
+                both = stopped_mask[1:] & stopped_mask[:-1]
+                max_outlier_stop = _max_run_duration(both, np.diff(g_times))
+                st['sum_outlier_stop'] += float(max_outlier_stop)
+                st['count_outlier_stop'] += 1
+
+            if outlier_ratio > max_outlier_prop:
+                st['invalid'] += 1
+                st['invalid_outlier_ratio'] += 1
                 continue
-                
-            if max_outlier_stop > config.get('max_outlier_stop_duration', 5.0):
-                segment_stats[segment_id]['invalid'] += 1
-                segment_stats[segment_id]['invalid_outlier_stop'] += 1
+            if max_outlier_stop > max_outlier_stop_dur:
+                st['invalid'] += 1
+                st['invalid_outlier_stop'] += 1
                 continue
-        
-        # Gap filtering check to filter out single traversals
-        time_diffs = group_df['time'].diff()
-        if (time_diffs > config['gap_threshold']).any():
-            segment_stats[segment_id]['invalid'] += 1
-            segment_stats[segment_id]['invalid_gap'] += 1
+
+        if g_len > 1 and (np.diff(g_times) > gap_thresh).any():
+            st['invalid'] += 1
+            st['invalid_gap'] += 1
             continue
-            
-        # Monotonicity check
-        valid_group = group_df[group_df['t_proj'] >= group_df['t_proj'].cummax()].copy()
-        if len(valid_group) == 0:
+
+        cummax = np.maximum.accumulate(g_tproj)
+        valid_mask = g_tproj >= cummax
+        if not valid_mask.any():
             logs.append(f"Track {track_id}, segment {segment_id} has no valid monotonic records. Skipping.")
-            segment_stats[segment_id]['invalid'] += 1
-            segment_stats[segment_id]['invalid_monotonic'] += 1
+            st['invalid'] += 1
+            st['invalid_monotonic'] += 1
             continue
-            
-        first_idx = valid_group.index[0]
-        last_idx = valid_group.index[-1]
-        
-        records = []
+
+        valid_rel = np.where(valid_mask)[0]
+        first_rel, last_rel = valid_rel[0], valid_rel[-1]
+        first_abs, last_abs = start + first_rel, start + last_rel
+        vg_times = g_times[valid_mask]
+        vg_speeds = g_speeds[valid_mask]
+        vg_tproj = g_tproj[valid_mask]
+
+        edge_t = max(min_edge, min(max_edge, edge_prop * segment_length))
+
+        prev_tp = prev_time = prev_speed = None
+        next_tp = next_time = next_speed = None
         has_prev = False
         has_following = False
-        
-        # Previous Record
-        if first_idx > 0:
-            prev_row = track_df.loc[first_idx - 1].copy()
-            if prev_row['segment_id'] != segment_id:
-                prev_row['t_proj'] = -(prev_row['segment_length'] - prev_row['t_proj'])
-                records.append(prev_row)
+
+        if first_abs > 0:
+            if seg_ids[first_abs - 1] != segment_id:
+                prev_tp = -(float(seglen_all[first_abs - 1]) - float(tproj_all[first_abs - 1]))
+                prev_time = float(times_all[first_abs - 1])
+                prev_speed = float(speeds_all[first_abs - 1])
                 has_prev = True
-        else:
-            if valid_group['t_proj'].iloc[0] <= max(config['min_edge_threshold'], min(config['max_edge_threshold'], config['edge_prop_threshold'] * segment_length)):
-                has_prev = True
-            
-                
-        # Current Records
-        records.extend([row for _, row in valid_group.iterrows()])
-        
-        # Following Record
-        if last_idx < len(track_df) - 1:
-            next_row = track_df.loc[last_idx + 1].copy()
-            if next_row['segment_id'] != segment_id:
-                next_row['t_proj'] = segment_length + next_row['t_proj']
-                records.append(next_row)
+        elif vg_tproj[0] <= edge_t:
+            has_prev = True
+
+        if last_abs < n - 1:
+            if seg_ids[last_abs + 1] != segment_id:
+                next_tp = segment_length + float(tproj_all[last_abs + 1])
+                next_time = float(times_all[last_abs + 1])
+                next_speed = float(speeds_all[last_abs + 1])
                 has_following = True
-        else:
-            if segment_length - valid_group['t_proj'].iloc[-1] <= max(config['min_edge_threshold'], min(config['max_edge_threshold'], config['edge_prop_threshold'] * segment_length)):
-                has_following = True
-                
-        # Quit if incomplete traversal (missing prev/next and not within threshold) or not enough records to interpolate
-        if not has_prev or not has_following or len(records) < 2:
-            segment_stats[segment_id]['invalid'] += 1
-            if len(records) < 2:
-                segment_stats[segment_id]['insufficient_records'] += 1
+        elif segment_length - vg_tproj[-1] <= edge_t:
+            has_following = True
+
+        n_records = len(vg_tproj) + (1 if prev_tp is not None else 0) + (1 if next_tp is not None else 0)
+        if not has_prev or not has_following or n_records < 2:
+            st['invalid'] += 1
+            if n_records < 2:
+                st['insufficient_records'] += 1
             else:
-                segment_stats[segment_id]['invalid_bounds'] += 1
+                st['invalid_bounds'] += 1
             continue
-        
-        
-            
-        traversal_df = pd.DataFrame(records)
-        
-        # Adjust offsets: distanceOffsets[i] = max(offset, prev + config['monotonicity_offset'])
-        t_projs = traversal_df['t_proj'].values.copy()
-        for i in range(1, len(t_projs)):
-            t_projs[i] = max(t_projs[i], t_projs[i-1] + config['monotonicity_offset'])
-        traversal_df['t_proj'] = t_projs
-        
-        t_proj = traversal_df['t_proj'].values
-        times = traversal_df['time'].values
-        speeds = traversal_df['speed'].values
-        
-        # Interpolate Time-Distance and Speed-Distance
+
+        parts_tp = []
+        parts_time = []
+        parts_speed = []
+        if prev_tp is not None:
+            parts_tp.append(np.array([prev_tp]))
+            parts_time.append(np.array([prev_time]))
+            parts_speed.append(np.array([prev_speed]))
+        parts_tp.append(vg_tproj)
+        parts_time.append(vg_times)
+        parts_speed.append(vg_speeds)
+        if next_tp is not None:
+            parts_tp.append(np.array([next_tp]))
+            parts_time.append(np.array([next_time]))
+            parts_speed.append(np.array([next_speed]))
+
+        t_proj_arr = np.concatenate(parts_tp).astype(float)
+        time_arr = np.concatenate(parts_time).astype(float)
+        speed_arr = np.concatenate(parts_speed).astype(float)
+
+        # Enforce strict monotonicity by offset — same as original
+        for i in range(1, len(t_proj_arr)):
+            min_allowed = t_proj_arr[i - 1] + mono_off
+            if t_proj_arr[i] < min_allowed:
+                t_proj_arr[i] = min_allowed
+
         try:
-            f_time = interp1d(t_proj, times, kind='linear', bounds_error=False, fill_value="extrapolate")
-            f_speed = interp1d(t_proj, speeds, kind='linear', bounds_error=False, fill_value="extrapolate")
-            
-            # Calculate traversal length
             length = segment_length
-                
-            traversal_time = float(f_time(length) - f_time(0.0))
+            t_at_0 = float(np.interp(0.0, t_proj_arr, time_arr))
+            t_at_L = float(np.interp(length, t_proj_arr, time_arr))
+            traversal_time = t_at_L - t_at_0
+
             if traversal_time <= 0:
-                temporal_mean_speed = valid_group['speed'].mean()
+                temporal_mean_speed = float(vg_speeds.mean())
             else:
                 temporal_mean_speed = length / traversal_time
-                
-            # Compute Spatial Mean Speed
-            first_offset = max(0.0, t_proj[0])
-            last_offset = min(length, t_proj[-1])
+
+            first_offset = max(0.0, float(t_proj_arr[0]))
+            last_offset = min(length, float(t_proj_arr[-1]))
             cur = math.ceil(first_offset)
-            end = math.floor(last_offset)
-            
-            if end - cur < config['speed_sample_interval']:
-                spatial_mean_speed = valid_group['speed'].mean()
+            end_sp = math.floor(last_offset)
+
+            if end_sp - cur < speed_int:
+                spatial_mean_speed = float(vg_speeds.mean())
             else:
-                eval_points = []
-                temp_cur = float(cur)
-                while end - temp_cur >= config['speed_sample_interval']:
-                    eval_points.append(temp_cur)
-                    temp_cur += config['speed_sample_interval']
-                spatial_mean_speed = np.mean(f_speed(np.array(eval_points)))
-                
+                n_pts = int((end_sp - cur) // speed_int) + 1
+                eval_points = cur + speed_int * np.arange(n_pts, dtype=float)
+                eval_points = eval_points[(end_sp - eval_points) >= speed_int]
+                if len(eval_points) == 0:
+                    spatial_mean_speed = float(vg_speeds.mean())
+                else:
+                    sp_vals = np.interp(eval_points, t_proj_arr, speed_arr)
+                    spatial_mean_speed = float(sp_vals.mean())
         except Exception as e:
-            # Fallback on error
             logs.append(f"Interpolation error for track {track_id}, segment {segment_id}: {e}")
-            total_dist = t_proj[-1] - t_proj[0]
-            total_t = times[-1] - times[0]
+            total_dist = float(t_proj_arr[-1] - t_proj_arr[0])
+            total_t = float(time_arr[-1] - time_arr[0])
             if total_t > 0:
                 temporal_mean_speed = total_dist / total_t
             else:
-                temporal_mean_speed = valid_group['speed'].mean()
-            spatial_mean_speed = valid_group['speed'].mean()
+                temporal_mean_speed = float(vg_speeds.mean())
+            spatial_mean_speed = float(vg_speeds.mean())
             traversal_time = total_t
 
-        # Calculate stopping duration
-        vg_times = valid_group['time'].values
-        vg_speeds = valid_group['speed'].values
-        max_stopping_duration = 0.0
-        current_stop_duration = 0.0
-        for i in range(1, len(valid_group)):
-            if vg_speeds[i] < config['stopped_speed_threshold'] and vg_speeds[i-1] < config['stopped_speed_threshold']:
-                current_stop_duration += vg_times[i] - vg_times[i-1]
-            else:
-                if current_stop_duration > max_stopping_duration:
-                    max_stopping_duration = current_stop_duration
-                current_stop_duration = 0.0
-                
-        if current_stop_duration > max_stopping_duration:
-            max_stopping_duration = current_stop_duration
-            
-        stopping_duration = max_stopping_duration
+        if len(vg_speeds) > 1:
+            stopped = vg_speeds < stopped_thresh
+            both_s = stopped[1:] & stopped[:-1]
+            stopping_duration = _max_run_duration(both_s, np.diff(vg_times))
+        else:
+            stopping_duration = 0.0
 
         traversals.append({
             'segment_id': segment_id,
             'track_id': track_id,
-            'timestamp': valid_group['time'].iloc[-1],
+            'timestamp': vg_times[-1],
             'temporal_mean_speed': temporal_mean_speed,
             'spatial_mean_speed': spatial_mean_speed,
             'stopping_duration': stopping_duration,
             'traversal_time': traversal_time,
             'segment_length': segment_length
         })
-        valid_original_indices.extend(group_df['original_index'].tolist())
-        
+        valid_original_indices.extend(g_orig.tolist())
+
     return traversals, segment_stats, logs, valid_original_indices
 
 def process_file(csv_path, config):
@@ -284,13 +377,46 @@ def process_file(csv_path, config):
         df = pd.read_csv(csv_path)
     except Exception as e:
         logger.error(f"Error reading {csv_path}: {e}")
-        return 0.0, 0.0, 0.0, [], []
+        return 0.0, 0.0, 0.0, [], [], [], [], [], [], [], []
 
     logger.info(f"Loaded {len(df)} rows. Time: {time.time() - t0:.2f}s")
     t1 = time.time()
-    
+
+    # Load internal junction segment IDs from the network gpkg in the same directory.
+    # Prefer the filtered network if it exists, otherwise fall back to the base one.
+    junction_segment_ids = set()
+    chain_segment_ids = set()
+    primary_secondary_ids = set()
+    for gpkg_name in ('osm_network_filtered.gpkg', 'osm_network.gpkg'):
+        gpkg_path = out_dir / gpkg_name
+        if gpkg_path.exists():
+            try:
+                net = gpd.read_file(gpkg_path)
+                if 'is_internal_junction' in net.columns and 'segment_id' in net.columns:
+                    mask = net['is_internal_junction'].astype(str).str.lower() == 'true'
+                    junction_segment_ids = set(net.loc[mask, 'segment_id'].astype(str))
+                    logger.info(f"Loaded {len(junction_segment_ids)} internal junction segment IDs from {gpkg_name}.")
+                chain_segment_ids = _compute_chain_segment_ids(net)
+                logger.info(f"Identified {len(chain_segment_ids)} interior chain segments in {gpkg_name}.")
+                primary_secondary_ids = _compute_primary_secondary_ids(net)
+                logger.info(f"Identified {len(primary_secondary_ids)} primary/secondary segments in {gpkg_name}.")
+            except Exception as e:
+                logger.warning(f"Could not read {gpkg_path} for junction IDs: {e}")
+            break
+
+    if junction_segment_ids:
+        ij_mask = df['segment_id'].astype(str).isin(junction_segment_ids)
+        ij_count = int(ij_mask.sum())
+        if ij_count > 0:
+            logger.info(f"Skipping {ij_count} trajectory points on internal junction segments.")
+            work_df = df.loc[~ij_mask].copy()
+        else:
+            work_df = df
+    else:
+        work_df = df
+
     # Process by track_id to allow matching previous/following records correctly
-    grouped = df.groupby('track_id')
+    grouped = work_df.groupby('track_id')
     logger.info(f"Grouped into {grouped.ngroups} tracks. Time: {time.time() - t1:.2f}s")
     
     t2 = time.time()
@@ -371,7 +497,9 @@ def process_file(csv_path, config):
     if top_10_prop:
         for sid, stats in top_10_prop:
             prop = stats['invalid'] / stats['total']
-            logger.info(f"Segment {sid}: {prop:.1%} removed ({stats['invalid']}/{stats['total']})")
+            chain_tag = CHAIN_CRITICAL_TAG if str(sid) in chain_segment_ids else ""
+            rt_tag = ROAD_TYPE_CRITICAL_TAG if str(sid) in primary_secondary_ids else ""
+            logger.info(f"Segment {sid}{chain_tag}{rt_tag}: {prop:.1%} removed ({stats['invalid']}/{stats['total']})")
             logger.info(f"    - Outlier Ratio: {stats['invalid_outlier_ratio']}")
             logger.info(f"    - Outlier Stop: {stats['invalid_outlier_stop']}")
             logger.info(f"    - Gap Threshold: {stats['invalid_gap']}")
@@ -387,7 +515,9 @@ def process_file(csv_path, config):
     
     if not valid_traversals:
         logger.info("No valid traversals found.")
-        return 0.0, file_avg_ratio, file_avg_stop, list(global_segment_stats.keys()), list(global_segment_stats.keys())
+        return (0.0, file_avg_ratio, file_avg_stop,
+                list(global_segment_stats.keys()), list(global_segment_stats.keys()),
+                [], [], [], [], [], [])
         
     if config.get('update_traversals') and all_valid_indices:
         logger.info(f"Updating {len(all_valid_indices)} valid trajectory points to is_outlier=False...")
@@ -475,27 +605,128 @@ def process_file(csv_path, config):
 
     invalid_segments_in_file = []
     low_volume_segments_in_file = []
+    high_volume_segments_in_file = []
+    chain_invalid_in_file = []
+    chain_low_volume_in_file = []
+    ps_invalid_in_file = []
+    ps_low_volume_in_file = []
     for sid_int, thresholds in segment_thresholds.items():
+        sid_str = str(sid_int)
         if thresholds['temporal_threshold'] == -1.0 or thresholds['spatial_threshold'] == -1.0:
-            invalid_segments_in_file.append(str(sid_int))
-            
+            invalid_segments_in_file.append(sid_str)
+            if sid_str in chain_segment_ids:
+                chain_invalid_in_file.append(sid_str)
+            if sid_str in primary_secondary_ids:
+                ps_invalid_in_file.append(sid_str)
+
         valid_count = thresholds['total_traversals'] - thresholds['invalid_traversals']
         if valid_count < 10:
-            low_volume_segments_in_file.append(str(sid_int))
+            low_volume_segments_in_file.append(sid_str)
+            if sid_str in chain_segment_ids:
+                chain_low_volume_in_file.append(sid_str)
+            if sid_str in primary_secondary_ids:
+                ps_low_volume_in_file.append(sid_str)
+        else:
+            high_volume_segments_in_file.append(sid_str)
+
+    logger.info("\n--- Chain Segments with Issues (Interior Connectors) ---")
+    if chain_invalid_in_file:
+        logger.info(f"[CHAIN - CRITICAL] {len(chain_invalid_in_file)} interior chain segment(s) have invalid thresholds:")
+        for sid in sorted(chain_invalid_in_file):
+            stats = segment_thresholds[int(sid)]
+            rt_tag = ROAD_TYPE_CRITICAL_TAG if sid in primary_secondary_ids else ""
+            logger.info(f"  Segment {sid}{rt_tag}: total={stats['total_traversals']} invalid={stats['invalid_traversals']}")
+    else:
+        logger.info("No invalid interior chain segments.")
+    if chain_low_volume_in_file:
+        logger.info(f"[CHAIN - CRITICAL] {len(chain_low_volume_in_file)} interior chain segment(s) have < 10 valid traversals:")
+        for sid in sorted(chain_low_volume_in_file):
+            stats = segment_thresholds[int(sid)]
+            valid_count = stats['total_traversals'] - stats['invalid_traversals']
+            rt_tag = ROAD_TYPE_CRITICAL_TAG if sid in primary_secondary_ids else ""
+            logger.info(f"  Segment {sid}{rt_tag}: valid={valid_count} total={stats['total_traversals']}")
+    else:
+        logger.info("No low-volume interior chain segments.")
+
+    logger.info("\n--- Primary/Secondary Segments with Issues ---")
+    if ps_invalid_in_file:
+        logger.info(f"[PRIMARY/SECONDARY - CRITICAL] {len(ps_invalid_in_file)} primary/secondary segment(s) have invalid thresholds:")
+        for sid in sorted(ps_invalid_in_file):
+            stats = segment_thresholds[int(sid)]
+            chain_tag = CHAIN_CRITICAL_TAG if sid in chain_segment_ids else ""
+            logger.info(f"  Segment {sid}{chain_tag}: total={stats['total_traversals']} invalid={stats['invalid_traversals']}")
+    else:
+        logger.info("No invalid primary/secondary segments.")
+    if ps_low_volume_in_file:
+        logger.info(f"[PRIMARY/SECONDARY - CRITICAL] {len(ps_low_volume_in_file)} primary/secondary segment(s) have < 10 valid traversals:")
+        for sid in sorted(ps_low_volume_in_file):
+            stats = segment_thresholds[int(sid)]
+            valid_count = stats['total_traversals'] - stats['invalid_traversals']
+            chain_tag = CHAIN_CRITICAL_TAG if sid in chain_segment_ids else ""
+            logger.info(f"  Segment {sid}{chain_tag}: valid={valid_count} total={stats['total_traversals']}")
+    else:
+        logger.info("No low-volume primary/secondary segments.")
+
+    # Per-file summary by segment category
+    general_invalid_count = len([s for s in invalid_segments_in_file if s not in chain_segment_ids and s not in primary_secondary_ids])
+    general_low_volume_count = len([s for s in low_volume_segments_in_file if s not in chain_segment_ids and s not in primary_secondary_ids])
+
+    logger.info(f"\n--- File Segment Summary ---")
+    logger.info(f"  Chain links:                  {len(chain_invalid_in_file)} invalid, {len(chain_low_volume_in_file)} low-volume (< 10 valid)")
+    logger.info(f"  Primary/Secondary:            {len(ps_invalid_in_file)} invalid, {len(ps_low_volume_in_file)} low-volume (< 10 valid)")
+    logger.info(f"  General (non-chain, non-P/S): {general_invalid_count} invalid, {general_low_volume_count} low-volume (< 10 valid)")
 
     logger.info(f"Threshold calculation took {time.time() - t3:.2f}s")
     
     t4 = time.time()
-    # RTSM Calculation
-    rtsm_values = []
-    for _, row in traversals_df.iterrows():
-        sid = int(row['segment_id'])
-        t_thresh = segment_thresholds[sid]['temporal_threshold']
-        s_thresh = segment_thresholds[sid]['spatial_threshold']
-        rtsm = calculate_rtsm(row['temporal_mean_speed'], row['spatial_mean_speed'], t_thresh, s_thresh)
-        rtsm_values.append(rtsm)
-        
+    # RTSM Calculation (vectorized)
+    sid_arr = traversals_df['segment_id'].astype(int).values
+    temp_arr = traversals_df['temporal_mean_speed'].values.astype(float)
+    spat_arr = traversals_df['spatial_mean_speed'].values.astype(float)
+    t_thresh_arr = np.array([segment_thresholds[s]['temporal_threshold'] for s in sid_arr], dtype=float)
+    s_thresh_arr = np.array([segment_thresholds[s]['spatial_threshold'] for s in sid_arr], dtype=float)
+
+    rtsm_values = np.zeros(len(sid_arr), dtype=float)
+    invalid_mask = (t_thresh_arr == -1.0) | (s_thresh_arr == -1.0)
+    worst_case = t_thresh_arr + s_thresh_arr
+    zero_wc = (worst_case == 0) & ~invalid_mask
+    unknown_speed = ((temp_arr == -1) | (spat_arr == -1)) & ~invalid_mask & ~zero_wc
+    active = ~invalid_mask & ~zero_wc & ~unknown_speed
+
+    if active.any():
+        t = temp_arr[active]
+        s = spat_arr[active]
+        tt = t_thresh_arr[active]
+        ss = s_thresh_arr[active]
+        t_ok = t >= tt
+        s_ok = s >= ss
+        dist = np.where(
+            s_ok,
+            np.where(t_ok, 0.0, tt - t),
+            np.where(t_ok, ss - s, (tt - t) + (ss - s))
+        )
+        rtsm_active = dist / worst_case[active]
+        rtsm_values[active] = np.clip(rtsm_active, 0.0, 1.0)
+
+    rtsm_values[invalid_mask] = -1.0
+    rtsm_values[zero_wc] = 0.0
+    rtsm_values[unknown_speed] = 1.0
+
     traversals_df['rtsm'] = rtsm_values
+
+    # Identify segments whose RTSM defaulted to -1
+    no_rtsm_segment_ids = set(traversals_df.loc[traversals_df['rtsm'] == -1.0, 'segment_id'].astype(str))
+    no_rtsm_count = int((rtsm_values == -1.0).sum())
+    logger.info(f"\n--- Segments with No RTSM (defaulted to -1) ---")
+    logger.info(f"{len(no_rtsm_segment_ids)} segment(s) could not calculate RTSM ({no_rtsm_count} traversals affected).")
+    if no_rtsm_segment_ids:
+        for sid in sorted(no_rtsm_segment_ids):
+            sid_int = int(sid)
+            stats = segment_thresholds.get(sid_int, {})
+            chain_tag = CHAIN_CRITICAL_TAG if sid in chain_segment_ids else ""
+            rt_tag = ROAD_TYPE_CRITICAL_TAG if sid in primary_secondary_ids else ""
+            logger.info(f"  Segment {sid}{chain_tag}{rt_tag}: total={stats.get('total_traversals', 0)} invalid={stats.get('invalid_traversals', 0)}")
+
     logger.info(f"RTSM Calculation took {time.time() - t4:.2f}s")
     
     with open(out_dir / 'segment_thresholds.json', 'w') as f:
@@ -509,7 +740,11 @@ def process_file(csv_path, config):
     if file_max_red_light_duration > 0:
         logger.info(f"Max red light duration for this file: {file_max_red_light_duration:.2f}s (Segment ID: {file_max_red_light_segment_id})\n")
         
-    return file_max_red_light_duration, file_avg_ratio, file_avg_stop, invalid_segments_in_file, low_volume_segments_in_file
+    return (file_max_red_light_duration, file_avg_ratio, file_avg_stop,
+            invalid_segments_in_file, low_volume_segments_in_file,
+            chain_invalid_in_file, chain_low_volume_in_file,
+            ps_invalid_in_file, ps_low_volume_in_file,
+            list(no_rtsm_segment_ids), high_volume_segments_in_file)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract vehicle traversal metrics from matched trajectories.")
@@ -534,10 +769,10 @@ if __name__ == "__main__":
         global_logger.addHandler(fh)
     
     config = {
-        "gap_threshold": 30.0,
+        "gap_threshold": 15.0,
         "min_edge_threshold": 8.0,
-        "max_edge_threshold": 25.0,
-        "edge_prop_threshold": 0.2,
+        "max_edge_threshold": 35.0,
+        "edge_prop_threshold": 0.5,
         "connection_length_threshold": 5.0,
         "speed_sample_interval": 10.0,
         "stopped_speed_threshold": 0.1,
@@ -557,78 +792,200 @@ if __name__ == "__main__":
     file_avg_stops = []
     invalid_segments_tracker = {}
     low_volume_segments_tracker = {}
+    chain_invalid_tracker = {}
+    chain_low_volume_tracker = {}
+    ps_invalid_tracker = {}
+    ps_low_volume_tracker = {}
+    no_rtsm_tracker = {}
+    high_volume_segments = set()
+
+    def _accumulate_results(res, label):
+        if not (isinstance(res, tuple) and len(res) == 11):
+            return
+        rl, a_ratio, a_stop, inv_segs, low_vol_segs, chain_inv, chain_low, ps_inv, ps_low, no_rtsm, high_vol = res
+        if rl > 0:
+            max_red_light_durations.append(rl)
+        file_avg_ratios.append(a_ratio)
+        file_avg_stops.append(a_stop)
+        for seg in inv_segs:
+            invalid_segments_tracker.setdefault(seg, []).append(label)
+        for seg in low_vol_segs:
+            low_volume_segments_tracker.setdefault(seg, []).append(label)
+        for seg in chain_inv:
+            chain_invalid_tracker.setdefault(seg, []).append(label)
+        for seg in chain_low:
+            chain_low_volume_tracker.setdefault(seg, []).append(label)
+        for seg in ps_inv:
+            ps_invalid_tracker.setdefault(seg, []).append(label)
+        for seg in ps_low:
+            ps_low_volume_tracker.setdefault(seg, []).append(label)
+        for seg in no_rtsm:
+            no_rtsm_tracker.setdefault(seg, []).append(label)
+        high_volume_segments.update(high_vol)
+
+        # Per-file segment summary in global log
+        general_inv_count = len([s for s in inv_segs if s not in set(chain_inv) and s not in set(ps_inv)])
+        general_low_count = len([s for s in low_vol_segs if s not in set(chain_low) and s not in set(ps_low)])
+        global_logger.info(f"\n--- File Segment Summary: {label} ---")
+        global_logger.info(f"  Chain links:                  {len(chain_inv)} invalid, {len(chain_low)} low-volume (< 10 valid)")
+        global_logger.info(f"  Primary/Secondary:            {len(ps_inv)} invalid, {len(ps_low)} low-volume (< 10 valid)")
+        global_logger.info(f"  General (non-chain, non-P/S): {general_inv_count} invalid, {general_low_count} low-volume (< 10 valid)")
 
     if args.file:
         csv_path = Path(args.file)
         if csv_path.exists():
-            res = process_file(csv_path, config)
-            if isinstance(res, tuple) and len(res) == 5:
-                rl, a_ratio, a_stop, inv_segs, low_vol_segs = res
-                if rl > 0:
-                    max_red_light_durations.append(rl)
-                file_avg_ratios.append(a_ratio)
-                file_avg_stops.append(a_stop)
-                for seg in inv_segs:
-                    if seg not in invalid_segments_tracker:
-                        invalid_segments_tracker[seg] = []
-                    invalid_segments_tracker[seg].append(csv_path.name)
-                for seg in low_vol_segs:
-                    if seg not in low_volume_segments_tracker:
-                        low_volume_segments_tracker[seg] = []
-                    low_volume_segments_tracker[seg].append(csv_path.name)
+            _accumulate_results(process_file(csv_path, config), csv_path.name)
     elif args.folder:
         root_path = Path(args.folder)
-        # Search for all subdirectories containing either file
         for subdir in root_path.rglob("*"):
             if subdir.is_dir():
                 filtered_path = subdir / "matched_trajectories_filtered.csv"
                 unfiltered_path = subdir / "matched_trajectories.csv"
-                
-                target_path = None
                 if filtered_path.exists():
                     target_path = filtered_path
                 elif unfiltered_path.exists():
                     target_path = unfiltered_path
-                
+                else:
+                    target_path = None
                 if target_path:
-                    res = process_file(target_path, config)
-                    if isinstance(res, tuple) and len(res) == 5:
-                        rl, a_ratio, a_stop, inv_segs, low_vol_segs = res
-                        if rl > 0:
-                            max_red_light_durations.append(rl)
-                        file_avg_ratios.append(a_ratio)
-                        file_avg_stops.append(a_stop)
-                        for seg in inv_segs:
-                            if seg not in invalid_segments_tracker:
-                                invalid_segments_tracker[seg] = []
-                            invalid_segments_tracker[seg].append(target_path.parent.name)
-                        for seg in low_vol_segs:
-                            if seg not in low_volume_segments_tracker:
-                                low_volume_segments_tracker[seg] = []
-                            low_volume_segments_tracker[seg].append(target_path.parent.name)
+                    _accumulate_results(process_file(target_path, config), target_path.parent.name)
     else:
         global_logger.info("Please provide either --file or --folder")
-        
+
     if len(max_red_light_durations) > 1:
         avg_max_red_light = sum(max_red_light_durations) / len(max_red_light_durations)
         global_logger.info(f"Average of max red light durations across {len(max_red_light_durations)} files: {avg_max_red_light:.2f}s")
-        
+
     if len(file_avg_ratios) > 0:
         overall_avg_ratio = sum(file_avg_ratios) / len(file_avg_ratios)
         overall_avg_stop = sum(file_avg_stops) / len(file_avg_stops)
         global_logger.info(f"Average of outlier proportions across {len(file_avg_ratios)} files: {overall_avg_ratio:.2%}")
         global_logger.info(f"Average of outlier stop durations across {len(file_avg_stops)} files: {overall_avg_stop:.2f}s")
-        
-    if invalid_segments_tracker:
-        global_logger.info("\n--- Invalid Segments Across Files ---")
-        for seg, files in sorted(invalid_segments_tracker.items(), key=lambda x: len(x[1]), reverse=True):
+
+    # Classify each segment into exactly one category:
+    # Priority: CHAIN > PRIMARY/SECONDARY > general
+    # Within each category: invalid > low-volume (no overlap)
+    all_chain_segs = set(chain_invalid_tracker) | set(chain_low_volume_tracker)
+    # Primary/secondary excludes any segment already in chain
+    ps_only_invalid = {s: f for s, f in ps_invalid_tracker.items() if s not in all_chain_segs}
+    ps_only_low_volume = {s: f for s, f in ps_low_volume_tracker.items() if s not in all_chain_segs}
+    all_categorized = all_chain_segs | set(ps_only_invalid) | set(ps_only_low_volume)
+    # Low-volume excludes invalid within each category
+    chain_low_only = {s: f for s, f in chain_low_volume_tracker.items() if s not in chain_invalid_tracker}
+    ps_low_only = {s: f for s, f in ps_only_low_volume.items() if s not in ps_only_invalid}
+    # General sections exclude segments already in chain or primary/secondary
+    general_invalid = {s: f for s, f in invalid_segments_tracker.items() if s not in all_categorized}
+    general_low_volume = {s: f for s, f in low_volume_segments_tracker.items()
+                          if s not in all_categorized and s not in general_invalid}
+
+    if chain_invalid_tracker or chain_low_only:
+        global_logger.info("\n=== CHAIN SEGMENTS WITH ISSUES (Interior Connectors) ===")
+        if chain_invalid_tracker:
+            global_logger.info("\n--- [CHAIN - CRITICAL] Invalid Interior Chain Segments Across Files ---")
+            for seg, files in sorted(chain_invalid_tracker.items(), key=lambda x: len(x[1]), reverse=True):
+                global_logger.info(f"Segment {seg}{CHAIN_CRITICAL_TAG} was invalid in {len(files)} file(s):")
+                for f in files:
+                    global_logger.info(f"  - {f}")
+        if chain_low_only:
+            global_logger.info("\n--- [CHAIN - CRITICAL] Low-Volume Interior Chain Segments Across Files ---")
+            for seg, files in sorted(chain_low_only.items(), key=lambda x: len(x[1]), reverse=True):
+                global_logger.info(f"Segment {seg}{CHAIN_CRITICAL_TAG} had < 10 valid traversals in {len(files)} file(s):")
+                for f in files:
+                    global_logger.info(f"  - {f}")
+
+    if ps_only_invalid or ps_low_only:
+        global_logger.info("\n=== PRIMARY/SECONDARY SEGMENTS WITH ISSUES ===")
+        if ps_only_invalid:
+            global_logger.info("\n--- [PRIMARY/SECONDARY - CRITICAL] Invalid Primary/Secondary Segments Across Files ---")
+            for seg, files in sorted(ps_only_invalid.items(), key=lambda x: len(x[1]), reverse=True):
+                global_logger.info(f"Segment {seg}{ROAD_TYPE_CRITICAL_TAG} was invalid in {len(files)} file(s):")
+                for f in files:
+                    global_logger.info(f"  - {f}")
+        if ps_low_only:
+            global_logger.info("\n--- [PRIMARY/SECONDARY - CRITICAL] Low-Volume Primary/Secondary Segments Across Files ---")
+            for seg, files in sorted(ps_low_only.items(), key=lambda x: len(x[1]), reverse=True):
+                global_logger.info(f"Segment {seg}{ROAD_TYPE_CRITICAL_TAG} had < 10 valid traversals in {len(files)} file(s):")
+                for f in files:
+                    global_logger.info(f"  - {f}")
+
+    if general_invalid:
+        global_logger.info("\n--- Invalid Segments Across Files [Non-Primary/Secondary and Non-Chain Links] ---")
+        for seg, files in sorted(general_invalid.items(), key=lambda x: len(x[1]), reverse=True):
             global_logger.info(f"Segment {seg} was invalid in {len(files)} files:")
             for f in files:
                 global_logger.info(f"  - {f}")
-                
-    if low_volume_segments_tracker:
+
+    if general_low_volume:
         global_logger.info("\n--- Low Volume Segments (< 10 Valid Traversals) ---")
-        for seg, files in sorted(low_volume_segments_tracker.items(), key=lambda x: len(x[1]), reverse=True):
+        for seg, files in sorted(general_low_volume.items(), key=lambda x: len(x[1]), reverse=True):
             global_logger.info(f"Segment {seg} had < 10 valid traversals in {len(files)} files:")
             for f in files:
                 global_logger.info(f"  - {f}")
+
+    if no_rtsm_tracker:
+        global_logger.info(f"\n=== Segments with No RTSM (defaulted to -1) ===")
+        global_logger.info(f"{len(no_rtsm_tracker)} segment(s) could not calculate RTSM across all files.")
+        for seg, files in sorted(no_rtsm_tracker.items(), key=lambda x: len(x[1]), reverse=True):
+            chain_tag = CHAIN_CRITICAL_TAG if seg in chain_invalid_tracker or seg in chain_low_volume_tracker else ""
+            rt_tag = ROAD_TYPE_CRITICAL_TAG if seg in ps_invalid_tracker or seg in ps_low_volume_tracker else ""
+            global_logger.info(f"Segment {seg}{chain_tag}{rt_tag} had no RTSM in {len(files)} file(s):")
+            for f in files:
+                global_logger.info(f"  - {f}")
+
+    # --- Build removed_segment_traversals and update global networks ---
+    if args.folder:
+        num_files = len(file_avg_ratios)
+        half_files = num_files / 2.0
+        removed_segment_traversals = set()
+
+        # Non-Primary/Secondary and Non-Chain segments invalid in more than half the files
+        for seg, files in general_invalid.items():
+            if len(files) > half_files:
+                removed_segment_traversals.add(seg)
+                global_logger.info(f"Removing general segment {seg}: invalid in {len(files)}/{num_files} files")
+
+        # Non-Primary/Secondary and Non-Chain segments with < 10 valid traversals in more than half the files
+        for seg, files in low_volume_segments_tracker.items():
+            if seg in all_categorized:
+                continue
+            if len(files) > half_files:
+                removed_segment_traversals.add(seg)
+                global_logger.info(f"Removing general segment {seg}: < 10 valid traversals in {len(files)}/{num_files} files")
+
+        # PRIMARY/SECONDARY segments (non-chain) invalid in more than half the files
+        for seg, files in ps_only_invalid.items():
+            if len(files) > half_files:
+                removed_segment_traversals.add(seg)
+                global_logger.info(f"Removing primary/secondary segment {seg}: invalid in {len(files)}/{num_files} files")
+
+        # PRIMARY/SECONDARY segments (non-chain) with < 10 valid traversals in ALL files
+        # A segment qualifies if it was never high-volume (>= 10 valid) in any file
+        for seg, files in ps_only_low_volume.items():
+            if seg not in high_volume_segments:
+                removed_segment_traversals.add(seg)
+                global_logger.info(f"Removing primary/secondary segment {seg}: < 10 valid traversals in all files (low-volume in {len(files)}/{num_files} files)")
+
+        root_path = Path(args.folder)
+        removed_traversals_path = root_path / 'removed_segment_traversals.json'
+        with open(removed_traversals_path, 'w') as f:
+            json.dump(sorted(removed_segment_traversals), f, indent=4)
+        global_logger.info(f"\nWrote {len(removed_segment_traversals)} segments to {removed_traversals_path}")
+
+        if removed_segment_traversals:
+            for gpkg_name in ('osm_network.gpkg', 'osm_network_common.gpkg'):
+                gpkg_path = root_path / gpkg_name
+                if gpkg_path.exists():
+                    try:
+                        gdf = gpd.read_file(gpkg_path)
+                        if 'segment_id' in gdf.columns:
+                            filtered = gdf[~gdf['segment_id'].astype(str).isin(removed_segment_traversals)]
+                            updated_name = gpkg_name.replace('.gpkg', '_updated.gpkg')
+                            updated_path = root_path / updated_name
+                            filtered.to_file(updated_path, driver='GPKG')
+                            global_logger.info(f"Saved {updated_path} ({len(gdf)} -> {len(filtered)} segments)")
+                        else:
+                            global_logger.warning(f"{gpkg_path} has no segment_id column, skipping.")
+                    except Exception as e:
+                        global_logger.error(f"Error filtering {gpkg_path}: {e}")
+        else:
+            global_logger.info("No segments to remove based on traversal data.")

@@ -151,7 +151,7 @@ def main():
     args = parser.parse_args()
     
     network_path = os.path.join(args.folder, 'osm_network_filtered.gpkg')
-    trajectories_path = os.path.join(args.folder, 'matched_trajectories_updated.csv')
+    trajectories_path = os.path.join(args.folder, 'matched_trajectories_filtered.csv')
     
     if not os.path.exists(network_path):
         network_path = os.path.join(args.folder, 'osm_network.gpkg')
