@@ -93,6 +93,8 @@ def visualize_adjacency(network_file, adjacency_file):
     edges['opposite_direction_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'opposite_direction'))
     edges['banned_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'banned_successors'))
     edges['only_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'only_successors'))
+    edges['merges_with_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'merges_with'))
+    edges['merged_by_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'merged_by'))
     
     # Ensure relevant columns exist before adding them to hover data
     for col in ['turn:lanes', 'turn', 'junction', 'is_internal_junction', 'is_shape_junction', 'is_semantic_junction']:
@@ -182,6 +184,18 @@ def visualize_adjacency(network_file, adjacency_file):
             "is_internal_junction": True,
             "is_shape_junction": True,
             "is_semantic_junction": True,
+            "to_info": True,
+            "from_info": True,
+            "crossed_by_info": True,
+            "turns_into_info": True,
+            "merges_into_info": True,
+            "u_turns_into_info": True,
+            "crosses_info": True,
+            "opposite_direction_info": True,
+            "banned_successors_info": True,
+            "only_successors_info": True,
+            "merges_with_info": True,
+            "merged_by_info": True,
             "lat": False,
             "lon": False
         },
@@ -347,7 +361,7 @@ def visualize_adjacency(network_file, adjacency_file):
 
         function highlightNeighbors(egoId, plotEl) {{
             var egoIdStr = String(egoId);
-            var adj = adjacency[egoIdStr] || {{to: [], from: [], merges_into: [], crossed_by: [], turns_into: [], u_turns_into: [], crosses: [], opposite_direction: [], banned_successors: [], only_successors: []}};
+            var adj = adjacency[egoIdStr] || {{to: [], from: [], merges_into: [], crossed_by: [], turns_into: [], u_turns_into: [], crosses: [], opposite_direction: [], banned_successors: [], only_successors: [], merges_with: [], merged_by: []}};
             
             // Update OSM Links in the control bar
             var osmids = osmidMap[egoIdStr];
@@ -540,6 +554,34 @@ def visualize_adjacency(network_file, adjacency_file):
                         mode: 'lines',
                         line: {{width: 6, color: 'teal'}},
                         name: egoIdStr + ' crosses ' + sid
+                    }});
+                }}
+            }});
+
+            // 11. Merges With (Yellow)
+            (adj.merges_with || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 6, color: 'yellow'}},
+                        name: egoIdStr + ' merges_with ' + sid
+                    }});
+                }}
+            }});
+
+            // 12. Merged By (Pink)
+            (adj.merged_by || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 6, color: 'pink'}},
+                        name: egoIdStr + ' merged_by ' + sid
                     }});
                 }}
             }});

@@ -109,11 +109,11 @@ def identify_rare_segments(gpkg_files, gdfs, base_dir, config, logger):
     A segment is considered rare if it appears in fewer than
     (1 - removal_threshold_fraction) * N networks. Segments flagged as
     internal junctions in any network are exempt from automatic removal
-    (those are expected to differ between runs). However, junction ids
-    that appear in an existing removed_segments.json are preserved — that
-    is the manual-override path for removing specific junctions.
-    Merges with any existing removed_segments.json and rewrites it.
-    Returns (removed_set, internal_junction_ids).
+    (those are expected to differ between runs).
+
+    Writes the internally-flagged set to removed_segments_unified.json.
+    Never reads or writes removed_segments.json — that file is user-maintained.
+    Returns (unified_removed, internal_junction_ids).
     """
     num_networks = len(gpkg_files)
     presence_count, internal_junction_ids = _collect_presence_and_junctions(gdfs)
@@ -127,26 +127,32 @@ def identify_rare_segments(gpkg_files, gdfs, base_dir, config, logger):
     logger.info(f"Presence histogram (networks_present -> num_segments): {dict(sorted(presence_hist.items()))}")
     logger.info(f"Internal junctions (exempt from removal): {len(internal_junction_ids)}")
     logger.info(f"Rarity threshold: keep if present in >= {min_presence:.2f} of {num_networks} networks")
-    logger.info(f"Rare segments: {len(rare_ids)}; newly removed after junction exemption: {len(newly_removed)}")
+    logger.info(f"Rare segments: {len(rare_ids)}; removed after junction exemption: {len(newly_removed)}")
 
+    unified_path = os.path.join(base_dir, config["removed_segments_unified_file"])
+    with open(unified_path, 'w') as f:
+        json.dump(sorted(newly_removed), f, indent=4)
+    logger.info(f"Wrote {len(newly_removed)} internally-flagged segments to {unified_path}")
+    return newly_removed, internal_junction_ids
+
+
+def load_manual_removed_segments(base_dir, config, logger):
+    """Read the user-maintained removed_segments.json without modifying it.
+
+    Returns a set of segment id strings, or an empty set if the file is absent.
+    """
     removed_path = os.path.join(base_dir, config["removed_segments_file"])
-    removed_set = set(newly_removed)
     if os.path.exists(removed_path):
         try:
             with open(removed_path, 'r') as f:
-                existing = {str(x) for x in json.load(f)}
-            manual_junctions = existing & internal_junction_ids
-            removed_set |= existing
-            logger.info(f"Merged with {len(existing)} segments from existing {removed_path}")
-            if manual_junctions:
-                logger.info(f"Preserving {len(manual_junctions)} manually-listed junction segments for removal.")
+                manual = {str(x) for x in json.load(f)}
+            logger.info(f"Loaded {len(manual)} manually-defined removed segments from {removed_path}")
+            return manual
         except Exception as e:
-            logger.warning(f"Could not read existing {removed_path}: {e}")
-
-    with open(removed_path, 'w') as f:
-        json.dump(sorted(removed_set), f, indent=4)
-    logger.info(f"Wrote {len(removed_set)} removed segments to {removed_path}")
-    return removed_set, internal_junction_ids
+            logger.warning(f"Could not read {removed_path}: {e}")
+    else:
+        logger.info(f"No {removed_path} found — no manual removals applied.")
+    return set()
 
 
 def write_missing_reports(gpkg_files, gdfs, unified_gdf, common_gdf, removed_set, internal_junction_ids, base_dir, config, logger):
@@ -365,6 +371,7 @@ def main():
         "removal_threshold_fraction": 0.2,
         "missing_count_threshold": 3,
         "removed_segments_file": "removed_segments.json",
+        "removed_segments_unified_file": "removed_segments_unified.json",
         "missing_report_file": "missing_segments.json",
         "network_missing_counts_file": "network_missing_counts.json",
         "output_unified_file": "osm_network.gpkg",
@@ -444,12 +451,43 @@ def main():
     unified_gdf, common_gdf, has_segment_id = deduplicate_networks(gdfs, logger)
     
     filtered_gdfs = list(gdfs)
+    merged_removed = set()
     if has_segment_id:
-        removed_set, internal_junction_ids = identify_rare_segments(valid_gpkg_files, gdfs, base_dir, CONFIG, logger)
-        write_missing_reports(valid_gpkg_files, gdfs, unified_gdf, common_gdf, removed_set, internal_junction_ids, base_dir, CONFIG, logger)
+        # Compute internally-flagged set → saved to removed_segments_unified.json only.
+        # removed_segments.json is never read or written by this step.
+        unified_removed, internal_junction_ids = identify_rare_segments(
+            valid_gpkg_files, gdfs, base_dir, CONFIG, logger
+        )
 
-        logger.info("Filtering individual networks based on removed_segments in parallel...")
-        filter_args = [(f, gdf, removed_set, args.filter_files, CONFIG) for f, gdf in zip(valid_gpkg_files, gdfs)]
+        # Load the user-maintained manual removals (file is never modified).
+        manual_removed = load_manual_removed_segments(base_dir, CONFIG, logger)
+
+        # Full merged set used for the unified/common network outputs.
+        merged_removed = unified_removed | manual_removed
+        logger.info(
+            f"Merged removal set: {len(merged_removed)} segments "
+            f"(unified-flagged: {len(unified_removed)}, manual: {len(manual_removed)})"
+        )
+
+        # Diagnostic reports reflect what will be excluded from the unified/common outputs.
+        write_missing_reports(
+            valid_gpkg_files, gdfs, unified_gdf, common_gdf,
+            merged_removed, internal_junction_ids, base_dir, CONFIG, logger
+        )
+
+        # Individual filtered network GPKGs:
+        #   - Without --filter_files: apply only the manual list (do not touch CSVs).
+        #   - With    --filter_files: apply the merged list and update CSVs.
+        network_filter_set = merged_removed if args.filter_files else manual_removed
+        logger.info(
+            f"Filtering individual networks using "
+            f"{'merged' if args.filter_files else 'manual-only'} removal set "
+            f"({len(network_filter_set)} segments)..."
+        )
+        filter_args = [
+            (f, gdf, network_filter_set, args.filter_files, CONFIG)
+            for f, gdf in zip(valid_gpkg_files, gdfs)
+        ]
         with multiprocessing.Pool(processes=num_processes) as pool:
             filter_results = pool.map(_filter_dataset, filter_args)
 
@@ -459,10 +497,11 @@ def main():
                 logger.info(log_msg)
             filtered_gdfs.append(filtered_gdf)
 
-        if removed_set:
-            logger.info(f"Applying {len(removed_set)} removals to unified and common networks...")
-            unified_gdf = unified_gdf[~unified_gdf['segment_id'].astype(str).isin(removed_set)].copy()
-            common_gdf = common_gdf[~common_gdf['segment_id'].astype(str).isin(removed_set)].copy()
+        # The unified and common outputs always exclude the full merged set.
+        if merged_removed:
+            logger.info(f"Applying {len(merged_removed)} merged removals to unified and common networks...")
+            unified_gdf = unified_gdf[~unified_gdf['segment_id'].astype(str).isin(merged_removed)].copy()
+            common_gdf = common_gdf[~common_gdf['segment_id'].astype(str).isin(merged_removed)].copy()
 
     avg_lanes_path = os.path.join(base_dir, CONFIG["average_lanes_file"])
     if os.path.exists(avg_lanes_path):
@@ -470,8 +509,8 @@ def main():
         with open(avg_lanes_path, 'r') as f:
             avg_lanes_data = json.load(f)
 
-        if has_segment_id and removed_set:
-            filtered_avg_lanes = {k: v for k, v in avg_lanes_data.items() if str(k) not in removed_set}
+        if has_segment_id and merged_removed:
+            filtered_avg_lanes = {k: v for k, v in avg_lanes_data.items() if str(k) not in merged_removed}
             logger.info(f"Filtered average_detected_lanes: {len(avg_lanes_data)} -> {len(filtered_avg_lanes)} segments (excluded {len(avg_lanes_data) - len(filtered_avg_lanes)} removed)")
         else:
             filtered_avg_lanes = avg_lanes_data

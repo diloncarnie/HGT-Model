@@ -43,6 +43,27 @@ def calculate_rtsm(temporal_speed, spatial_speed, temp_thresh, spat_thresh):
     rtsm = distance / worst_case_distance
     return float(max(0.0, min(1.0, rtsm)))
 
+def _distance_outlier_ratio(tproj, outlier_mask, seg_length):
+    """Fraction of segment length 'covered' by outlier points via Voronoi
+    half-intervals in t_proj space. Independent of sample density."""
+    if seg_length <= 0:
+        return 0.0
+    n = len(tproj)
+    if n == 0:
+        return 0.0
+    order = np.argsort(tproj, kind='stable')
+    tp = np.clip(tproj[order].astype(float), 0.0, float(seg_length))
+    om = outlier_mask[order]
+    if n == 1:
+        return float(om[0])
+    bounds = np.empty(n + 1, dtype=float)
+    bounds[0] = 0.0
+    bounds[-1] = float(seg_length)
+    bounds[1:-1] = (tp[:-1] + tp[1:]) / 2.0
+    widths = np.clip(np.diff(bounds), 0.0, None)
+    return float(widths[om].sum() / seg_length)
+
+
 def _max_run_duration(mask_both, dt):
     """Max sum of dt[i] over runs where mask_both[i] stays True."""
     if not mask_both.any():
@@ -137,10 +158,11 @@ def process_track(track_data, config):
     segment_stats = {}
     logs = []
     valid_original_indices = []
+    provisional_traversals = []  # rejected solely by stop-duration; reconsidered in pass 2
 
     n = len(track_df)
     if n == 0:
-        return traversals, segment_stats, logs, valid_original_indices
+        return traversals, segment_stats, logs, valid_original_indices, provisional_traversals
 
     seg_ids = track_df['segment_id'].values
     times_all = track_df['time'].values.astype(float)
@@ -185,14 +207,15 @@ def process_track(track_data, config):
         g_orig = orig_idx_all[start:end]
         g_len = end - start
 
+        max_outlier_stop = 0.0
+        stop_duration_rejected = False
         if has_outlier_col:
             g_outlier = outlier_all[start:end]
-            outlier_ratio = float(g_outlier.mean())
+            outlier_ratio = _distance_outlier_ratio(g_tproj, g_outlier, segment_length)
             st['sum_outlier_ratio'] += outlier_ratio
             st['count_outlier_ratio'] += 1
 
             stopped_mask = g_outlier & (g_speeds < stopped_thresh)
-            max_outlier_stop = 0.0
             if stopped_mask.any() and g_len > 1:
                 both = stopped_mask[1:] & stopped_mask[:-1]
                 max_outlier_stop = _max_run_duration(both, np.diff(g_times))
@@ -206,7 +229,8 @@ def process_track(track_data, config):
             if max_outlier_stop > max_outlier_stop_dur:
                 st['invalid'] += 1
                 st['invalid_outlier_stop'] += 1
-                continue
+                stop_duration_rejected = True
+                # fall through: compute full traversal so pass 2 can recover it
 
         if g_len > 1 and (np.diff(g_times) > gap_thresh).any():
             st['invalid'] += 1
@@ -332,7 +356,7 @@ def process_track(track_data, config):
         else:
             stopping_duration = 0.0
 
-        traversals.append({
+        record = {
             'segment_id': segment_id,
             'track_id': track_id,
             'timestamp': vg_times[-1],
@@ -341,10 +365,18 @@ def process_track(track_data, config):
             'stopping_duration': stopping_duration,
             'traversal_time': traversal_time,
             'segment_length': segment_length
-        })
-        valid_original_indices.extend(g_orig.tolist())
+        }
+        if stop_duration_rejected:
+            provisional_traversals.append({
+                'record': record,
+                'max_outlier_stop': float(max_outlier_stop),
+                'orig_indices': g_orig.tolist()
+            })
+        else:
+            traversals.append(record)
+            valid_original_indices.extend(g_orig.tolist())
 
-    return traversals, segment_stats, logs, valid_original_indices
+    return traversals, segment_stats, logs, valid_original_indices, provisional_traversals
 
 def process_file(csv_path, config):
     out_dir = Path(csv_path).parent
@@ -381,6 +413,15 @@ def process_file(csv_path, config):
 
     logger.info(f"Loaded {len(df)} rows. Time: {time.time() - t0:.2f}s")
     t1 = time.time()
+
+    # Load empirical free flow speeds to merge into thresholds
+    empirical_speeds_path = out_dir / 'empirical_free_flow_speeds.json'
+    empirical_speeds = {}
+    if empirical_speeds_path.exists():
+        with open(empirical_speeds_path, 'r') as f:
+            empirical_speeds = json.load(f)
+    else:
+        logger.warning(f"Could not find {empirical_speeds_path}. Falling back to default values where necessary.")
 
     # Load internal junction segment IDs from the network gpkg in the same directory.
     # Prefer the filtered network if it exists, otherwise fall back to the base one.
@@ -422,15 +463,17 @@ def process_file(csv_path, config):
     t2 = time.time()
     valid_traversals = []
     all_valid_indices = []
+    provisional_traversals = []
     global_segment_stats = {}
-    
+
     process_func = partial(process_track, config=config)
     with mp.Pool() as pool:
-        for res_traversals, res_stats, res_logs, res_indices in pool.imap_unordered(process_func, grouped):
+        for res_traversals, res_stats, res_logs, res_indices, res_provisional in pool.imap_unordered(process_func, grouped):
             for msg in res_logs:
                 logger.info(msg)
             valid_traversals.extend(res_traversals)
             all_valid_indices.extend(res_indices)
+            provisional_traversals.extend(res_provisional)
             for sid, stats in res_stats.items():
                 if sid not in global_segment_stats:
                     global_segment_stats[sid] = {
@@ -583,6 +626,7 @@ def process_file(csv_path, config):
             'temporal_threshold': temp_thresh,
             'spatial_threshold': spat_thresh,
             'free_flow_speed': free_flow_speed,
+            'empirical_free_flow_speed': empirical_speeds.get(str(segment_id), -1.0),
             'red_light_duration': red_light_duration,
             'total_traversals': global_segment_stats[segment_id]['total'],
             'invalid_traversals': global_segment_stats[segment_id]['invalid']
@@ -598,10 +642,47 @@ def process_file(csv_path, config):
                 'temporal_threshold': -1.0,
                 'spatial_threshold': -1.0,
                 'free_flow_speed': -1.0,
+                'empirical_free_flow_speed': empirical_speeds.get(str(segment_id), -1.0),
                 'red_light_duration': 0.0,
                 'total_traversals': stats['total'],
                 'invalid_traversals': stats['invalid']
             }
+
+    # --- Pass 2: red-light buffer recovery for stop-duration-rejected traversals ---
+    if provisional_traversals:
+        max_outlier_stop_dur = config.get('max_outlier_stop_duration', 5.0)
+        recovered = 0
+        recovered_by_seg = {}
+        recovered_records = []
+        for item in provisional_traversals:
+            rec = item['record']
+            sid_int = int(rec['segment_id'])
+            red_light = segment_thresholds.get(sid_int, {}).get('red_light_duration', 0.0) or 0.0
+            effective_thresh = max_outlier_stop_dur + float(red_light)
+            if item['max_outlier_stop'] <= effective_thresh:
+                recovered_records.append(rec)
+                all_valid_indices.extend(item['orig_indices'])
+                sid_key = rec['segment_id']
+                if sid_key in global_segment_stats:
+                    global_segment_stats[sid_key]['invalid'] = max(0, global_segment_stats[sid_key]['invalid'] - 1)
+                    global_segment_stats[sid_key]['invalid_outlier_stop'] = max(0, global_segment_stats[sid_key]['invalid_outlier_stop'] - 1)
+                if sid_int in segment_thresholds:
+                    segment_thresholds[sid_int]['invalid_traversals'] = max(
+                        0, segment_thresholds[sid_int]['invalid_traversals'] - 1)
+                recovered += 1
+                recovered_by_seg[sid_key] = recovered_by_seg.get(sid_key, 0) + 1
+
+        if recovered_records:
+            traversals_df = pd.concat([traversals_df, pd.DataFrame(recovered_records)], ignore_index=True)
+
+        logger.info(f"\n--- Pass 2: Red-Light Buffer Recovery ---")
+        logger.info(f"Provisional (stop-duration-rejected) traversals: {len(provisional_traversals)}")
+        logger.info(f"Recovered with red-light buffer: {recovered}")
+        if recovered_by_seg:
+            top_recovered = sorted(recovered_by_seg.items(), key=lambda x: x[1], reverse=True)[:10]
+            for sid, cnt in top_recovered:
+                rl = segment_thresholds.get(int(sid), {}).get('red_light_duration', 0.0)
+                logger.info(f"  Segment {sid}: {cnt} recovered (red_light_duration={rl:.2f}s)")
 
     invalid_segments_in_file = []
     low_volume_segments_in_file = []
@@ -770,7 +851,7 @@ if __name__ == "__main__":
     
     config = {
         "gap_threshold": 15.0,
-        "min_edge_threshold": 8.0,
+        "min_edge_threshold": 10.0,
         "max_edge_threshold": 35.0,
         "edge_prop_threshold": 0.5,
         "connection_length_threshold": 5.0,
@@ -782,8 +863,8 @@ if __name__ == "__main__":
         "percentile_red_light": 95,
         "percentile_spatial": 5,
         "percentile_free_flow": 85,
-        "max_outlier_proportion": 0.50,
-        "max_outlier_stop_duration": 5.0,
+        "max_outlier_proportion": 0.80,
+        "max_outlier_stop_duration": 25.0,
         "update_traversals": args.update_traversals
     }
     

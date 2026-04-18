@@ -69,6 +69,11 @@ def process_frenet_continuous_chunk(chunk_data_tuple):
                     successor_lengths = ego_adj.get('to_lengths', [])
                     predecessor_lengths = ego_adj.get('from_lengths', [])
                     
+                    to_junc_chain = ego_adj.get('to_junction_chain', [])
+                    to_junc_lengths = ego_adj.get('to_junction_chain_lengths', [])
+                    from_junc_chain = ego_adj.get('from_junction_chain', [])
+                    from_junc_lengths = ego_adj.get('from_junction_chain_lengths', [])
+                    
                     for _, n_row in n_df.iterrows():
                         n_seg = n_row['segment_id']
                         n_az = n_row['azcar']
@@ -80,14 +85,24 @@ def process_frenet_continuous_chunk(chunk_data_tuple):
                         # Topological Check
                         if n_seg == ego_seg:
                             delta_S = n_row['t_proj'] - ego_S
+                        elif n_seg in to_junc_chain:
+                            idx_j = to_junc_chain.index(n_seg)
+                            intermediate_dist = sum(to_junc_lengths[:idx_j])
+                            delta_S = (ego['segment_length'] - ego_S) + intermediate_dist + n_row['t_proj']
                         elif n_seg in successors:
                             idx_s = successors.index(n_seg)
+                            junc_dist = sum(to_junc_lengths)
                             intermediate_dist = sum(successor_lengths[:idx_s])
-                            delta_S = (ego['segment_length'] - ego_S) + intermediate_dist + n_row['t_proj']
+                            delta_S = (ego['segment_length'] - ego_S) + junc_dist + intermediate_dist + n_row['t_proj']
+                        elif n_seg in from_junc_chain:
+                            idx_j = from_junc_chain.index(n_seg)
+                            intermediate_dist = sum(from_junc_lengths[:idx_j])
+                            delta_S = -ego_S - intermediate_dist - (n_row['segment_length'] - n_row['t_proj'])
                         elif n_seg in predecessors:
                             idx_p = predecessors.index(n_seg)
+                            junc_dist = sum(from_junc_lengths)
                             intermediate_dist = sum(predecessor_lengths[:idx_p])
-                            delta_S = -ego_S - intermediate_dist - (n_row['segment_length'] - n_row['t_proj'])
+                            delta_S = -ego_S - junc_dist - intermediate_dist - (n_row['segment_length'] - n_row['t_proj'])
                         else:
                             continue
                             
@@ -154,26 +169,37 @@ def process_single_folder(folder_path, config):
     print(f"\n--- Processing Folder: {folder_path} ---")
     folder_start_time = time.time()
     
-    matched_file = os.path.join(folder_path, "matched_trajectories_filtered.csv")
+    matched_file = os.path.join(folder_path, "matched_trajectories_updated.csv")
     if not os.path.exists(matched_file):
         matched_file = os.path.join(folder_path, "matched_trajectories.csv")
         
-    speeds_file = os.path.join(folder_path, "empirical_free_flow_speeds.json")
+    thresh_file = os.path.join(folder_path, "segment_thresholds.json")
     
     if not os.path.exists(matched_file):
-        print(f"Skipping {folder_path}: missing matched_trajectories_filtered.csv or matched_trajectories.csv")
+        print(f"Skipping {folder_path}: missing matched_trajectories_updated.csv or matched_trajectories.csv")
         return
-    if not os.path.exists(speeds_file):
-        print(f"Skipping {folder_path}: missing required empirical_free_flow_speeds.json")
+    if not os.path.exists(thresh_file):
+        print(f"Skipping {folder_path}: missing required segment_thresholds.json")
         return
-        
+    
+    print(f"Loading matched trajectories from {matched_file}...")
     df = pd.read_csv(matched_file, dtype={'track_id': str, 'segment_id': str})
     if df.empty:
         print("Matched trajectories file is empty.")
         return
         
-    with open(speeds_file, 'r') as f:
-        empirical_speeds = json.load(f)
+    with open(thresh_file, 'r') as f:
+        segment_thresholds = json.load(f)
+        
+    effective_speeds = {}
+    for sid, data in segment_thresholds.items():
+        spat_thresh = data.get('spatial_threshold', -1.0)
+        emp_speed = data.get('empirical_free_flow_speed', -1.0)
+        
+        if spat_thresh != -1.0 and spat_thresh is not None:
+            effective_speeds[str(sid)] = spat_thresh
+        else:
+            effective_speeds[str(sid)] = emp_speed if emp_speed != -1.0 else config["default_speed_fallback"]
         
     adjacency = config["topological_adjacency"]
     
@@ -216,7 +242,7 @@ def process_single_folder(folder_path, config):
         ego_df = df[(df['is_CAV'] == True) & (df['time'] >= t_start) & (df['time'] < t_end)]
         if not ego_df.empty:
             bg_df = df[(df['time'] >= t_start - time_thresh) & (df['time'] <= t_end + time_thresh)]
-            time_groups.append((ego_df.copy(), bg_df.copy(), adjacency, empirical_speeds, config))
+            time_groups.append((ego_df.copy(), bg_df.copy(), adjacency, effective_speeds, config))
             
         t_start = t_end
         
@@ -237,7 +263,7 @@ def process_single_folder(folder_path, config):
     print("Calculating final kinematics...")
     kin_start = time.time()
     
-    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(empirical_speeds).fillna(config["default_speed_fallback"])
+    final_df['segment_free_flow_speed'] = final_df['segment_id'].map(effective_speeds).fillna(config["default_speed_fallback"])
     final_df['relative_ego_speed'] = final_df['speed'] / final_df['segment_free_flow_speed']
     
     final_df = final_df.sort_values(['track_id', 'time'])
@@ -280,11 +306,11 @@ def main():
     overall_start = time.time()
     
     print("Loading topological adjacency...")
-    if not os.path.exists('topological_adjacency_merged.json'):
-        print("Error: topological_adjacency_merged.json not found. Make sure to run the external OSM downloader script.")
+    if not os.path.exists('topological_adjacency.json'):
+        print("Error: topological_adjacency.json not found. Make sure to run the external OSM downloader script.")
         return
         
-    with open('topological_adjacency_merged.json', 'r') as f:
+    with open('topological_adjacency.json', 'r') as f:
         topological_adjacency = json.load(f)
 
     config = {
@@ -304,13 +330,13 @@ def main():
     # Discover target folders
     if os.path.isdir(args.input_path):
         # Is it a specific folder?
-        if os.path.exists(os.path.join(args.input_path, 'matched_trajectories_filtered.csv')) or \
+        if os.path.exists(os.path.join(args.input_path, 'matched_trajectories_updated.csv')) or \
            os.path.exists(os.path.join(args.input_path, 'matched_trajectories.csv')):
             folders = [args.input_path]
         else:
             folders = []
             for root, dirs, files in os.walk(args.input_path):
-                if 'matched_trajectories_filtered.csv' in files or 'matched_trajectories.csv' in files:
+                if 'matched_trajectories_updated.csv' in files or 'matched_trajectories.csv' in files:
                     folders.append(root)
     else:
         print(f"Error: {args.input_path} is not a valid directory.")

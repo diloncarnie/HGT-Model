@@ -50,7 +50,7 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
                 df_p['track_id'] = df_p['track_id'].astype(str) + f"_{folder_name}"
                 
                 # Load matched trajectories
-                match_file = os.path.join(subdir, 'matched_trajectories_filtered.csv')
+                match_file = os.path.join(subdir, 'matched_trajectories_updated.csv')
                 if not os.path.exists(match_file):
                     match_file = os.path.join(subdir, 'matched_trajectories.csv')
         
@@ -93,7 +93,11 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         all_processed = df['track_id'].unique()
         df['track_id'] = df['track_id'].astype(str) # Ensure string format
         
-        matched_file = os.path.join(os.path.dirname(input_path), 'matched_trajectories.csv')
+      
+        matched_file = os.path.join(os.path.dirname(input_path), 'matched_trajectories_updated.csv')
+        if not os.path.exists(matched_file):
+            matched_file = os.path.join(os.path.dirname(input_path), 'matched_trajectories.csv')
+            
         if not os.path.exists(matched_file):
             print(f"Warning: matched_trajectories.csv not found at {matched_file}. Grey points will not be shown.")
             df_matched = pd.DataFrame()

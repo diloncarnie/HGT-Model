@@ -149,17 +149,17 @@ def process_file(csv_path, tau=30.0, downsample_interval=30.0):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Aggregate traffic states using T-EMA and downsampling.")
     parser.add_argument("--file", type=str, help="Path to a single traversal_metrics.csv file")
-    parser.add_argument("--root-dir", type=str, help="Root directory to search recursively for traversal_metrics.csv")
+    parser.add_argument("--folder", type=str, help="Root directory to search recursively for traversal_metrics.csv")
     parser.add_argument("--tau", type=float, default=30.0, help="Time constant tau for T-EMA (seconds)")
-    parser.add_argument("--interval", type=float, default=30.0, help="Minimum gap interval for downsampling (seconds)")
+    parser.add_argument("--interval", type=float, default=10.0, help="Minimum gap interval for downsampling (seconds)")
     
     args = parser.parse_args()
     
     if args.file:
         process_file(args.file, args.tau, args.interval)
-    elif args.root_dir:
-        root_path = Path(args.root_dir)
+    elif args.folder:
+        root_path = Path(args.folder)
         for csv_path in root_path.rglob("traversal_metrics.csv"):
             process_file(csv_path, args.tau, args.interval)
     else:
-        print("Please provide either --file or --root-dir")
+        print("Please provide either --file or --folder")
