@@ -54,7 +54,7 @@ junctions_logger = setup_logger("junctions", "junction_detections.log")
 def get_osm_network(bbox, config):
     # Instruct OSMnx to retain advanced routing and road rule tags
     ox.settings.useful_tags_way += ['turn:lanes', 'turn', 'junction', 'access']
-    ox.settings.useful_tags_node += ['traffic_signals:direction', 'crossing']
+    ox.settings.useful_tags_node += ['traffic_signals:direction', 'crossing', 'crossing:signals']
 
     logger.info(f"Downloading OSM network for bounding box: {bbox}...")    # Download using the provided bounding box
     graph = ox.graph_from_bbox(bbox=bbox, network_type='all', simplify=False)
@@ -143,9 +143,13 @@ def get_osm_network(bbox, config):
     for n, d in filtered_graph.nodes(data=True):
         hw = str(d.get('highway', ''))
         crossing = str(d.get('crossing', ''))
+        crossing_signals = str(d.get('crossing:signals', '')).lower()
+        
         has_hw = 'traffic_signals' in hw
         has_cr = 'traffic_signals' in crossing
-        if has_hw or has_cr:
+        has_cr_sig = crossing_signals in ['yes', 'true', '1']
+        
+        if has_hw or has_cr or has_cr_sig:
             sig_type = 'highway' if has_hw else 'crossing'
             signal_nodes_raw.append((n, d['x'], d['y'], d.get('traffic_signals:direction'), sig_type))
 
@@ -381,7 +385,7 @@ def tag_signals_at_end(edges, signal_data, adjacency, tolerance=1.0):
             sid = s.get('hosted_on_segment')
             pos = s.get('position_along_host_m')
             
-            if sid and pos is not None and pos <= 10.0:
+            if sid and pos is not None and pos <= 15.0:
                 is_invalid = False
                 if sid in adjacency:
                     for pred_sid in adjacency[sid].get('from', []):
@@ -828,15 +832,6 @@ def build_controllers(edges, signal_data, adjacency, config):
             'x_utm': centroid_utm.x, 'y_utm': centroid_utm.y,
         }
 
-        # controlled_crossed_by: limit crossed_by to same-controller approaches
-        approach_set = set(group.get('approach_segments', []))
-        controlled_crossed_by = {}
-        for a_sid in approach_set:
-            if a_sid in adjacency:
-                crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_set]
-                if crosses:
-                    controlled_crossed_by[a_sid] = crosses
-
         # junction_id: pick a shape-junction segment or first junction segment
         junction_id = None
         for sid in group['junction_segments']:
@@ -852,7 +847,6 @@ def build_controllers(edges, signal_data, adjacency, config):
             'junction_id': junction_id,
             'approach_segments': group.get('approach_segments', []),
             'junction_segments': group['junction_segments'],
-            'controlled_crossed_by': controlled_crossed_by,
             'raw_osm_signals': raw_osm_signals,
             'signal_count': len(raw_osm_signals),
             'junction_centroid': junction_centroid,
@@ -888,16 +882,9 @@ def build_controllers(edges, signal_data, adjacency, config):
             controller_id = f"s_{osm_node_id}"
             host_seg = sd.get('hosted_on_segment')
             
-            approach_set = set(v_to_non_junc_segs.get(v_node, []))
-            if host_seg:
-                approach_set.add(host_seg)
-                if host_seg in adjacency:
-                    adj_ego = adjacency[host_seg]
-                    # Discard merge segments
-                    for s in adj_ego.get('merges_with', []):
-                        approach_set.discard(s)
-                    for s in adj_ego.get('merged_by', []):
-                        approach_set.discard(s)
+            # For standalone signal groups containing only 1 signal, restrict approach_segments exclusively to the host_seg.
+            # This prevents unrelated segments (e.g. crossing roads sharing the node) from being added.
+            approach_set = {host_seg} if host_seg else set()
             approach_segments = list(approach_set)
 
             raw_osm_signals = [{
@@ -917,20 +904,11 @@ def build_controllers(edges, signal_data, adjacency, config):
                 'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
             }
 
-            # controlled_crossed_by: limit crossed_by to same-controller approaches
-            controlled_crossed_by = {}
-            for a_sid in approach_segments:
-                if a_sid in adjacency:
-                    crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_segments]
-                    if crosses:
-                        controlled_crossed_by[a_sid] = crosses
-
             controllers[controller_id] = {
                 'controller_id': controller_id,
                 'junction_id': None,
                 'approach_segments': approach_segments,
                 'junction_segments': [],
-                'controlled_crossed_by': controlled_crossed_by,
                 'raw_osm_signals': raw_osm_signals,
                 'signal_count': 1,
                 'junction_centroid': junction_centroid,
@@ -978,20 +956,11 @@ def build_controllers(edges, signal_data, adjacency, config):
                 'x_utm': centroid_utm.x, 'y_utm': centroid_utm.y,
             }
 
-            # controlled_crossed_by: limit crossed_by to same-controller approaches
-            controlled_crossed_by = {}
-            for a_sid in approach_segments:
-                if a_sid in adjacency:
-                    crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_segments]
-                    if crosses:
-                        controlled_crossed_by[a_sid] = crosses
-
             controllers[controller_id] = {
                 'controller_id': controller_id,
                 'junction_id': None,
                 'approach_segments': approach_segments,
                 'junction_segments': [],
-                'controlled_crossed_by': controlled_crossed_by,
                 'raw_osm_signals': raw_osm_signals,
                 'signal_count': len(raw_osm_signals),
                 'junction_centroid': junction_centroid,
@@ -1029,20 +998,11 @@ def build_controllers(edges, signal_data, adjacency, config):
             'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
         }
 
-        # controlled_crossed_by: limit crossed_by to same-controller approaches
-        controlled_crossed_by = {}
-        for a_sid in approach_segments:
-            if a_sid in adjacency:
-                crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_segments]
-                if crosses:
-                    controlled_crossed_by[a_sid] = crosses
-
         controllers[controller_id] = {
             'controller_id': controller_id,
             'junction_id': None,
             'approach_segments': approach_segments,
             'junction_segments': [],
-            'controlled_crossed_by': controlled_crossed_by,
             'raw_osm_signals': raw_osm_signals,
             'signal_count': 1,
             'junction_centroid': junction_centroid,
@@ -1064,14 +1024,130 @@ def build_controllers(edges, signal_data, adjacency, config):
                 valid_approaches.append(sid)
         
         ctrl['approach_segments'] = valid_approaches
-        
-        controlled_crossed_by = {}
-        for a_sid in valid_approaches:
-            if a_sid in adjacency:
-                crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in valid_approaches]
-                if crosses:
-                    controlled_crossed_by[a_sid] = crosses
-        ctrl['controlled_crossed_by'] = controlled_crossed_by
+
+    # ------------------------------------------------------------------
+    # Step 5c Convert short approach segments to junction links
+    # ------------------------------------------------------------------
+    logger.info("Checking for short approach segments (< 25m) to convert to junction links...")
+    short_approach_threshold = 25.0
+    converted_count = 0
+
+    for ctrl_id, ctrl in controllers.items():
+        changed = True
+        while changed:
+            changed = False
+            new_approaches = set(ctrl.get('approach_segments', []))
+            for sid in list(new_approaches):
+                row = seg_lookup.get(sid)
+                if row is not None and 'length' in row and float(row['length']) < short_approach_threshold:
+                    new_approaches.remove(sid)
+                    if sid not in ctrl['junction_segments']:
+                        ctrl['junction_segments'].append(sid)
+                        
+                    # Mark as junction link
+                    mask = edges['segment_id'].astype(str) == sid
+                    edges.loc[mask, 'is_internal_junction'] = 'True'
+                    
+                    # Add predecessors to approaches
+                    if sid in adjacency:
+                        for pred in adjacency[sid].get('from', []):
+                            if pred not in ctrl['junction_segments']:
+                                new_approaches.add(pred)
+                    
+                    changed = True
+                    converted_count += 1
+                    junctions_logger.info(f"Converted short approach segment {sid} (< 25m) to junction link for controller {ctrl_id}.")
+                    
+            ctrl['approach_segments'] = list(new_approaches)
+            
+    if converted_count > 0:
+        logger.info(f"Converted {converted_count} short approach segments into junction links.")
+
+    # ------------------------------------------------------------------
+    # Step 5d Recover approach segments for isolated standalone controllers
+    # ------------------------------------------------------------------
+    for ctrl_id, ctrl in controllers.items():
+        if ctrl.get('source') == 'standalone_signal' and not ctrl.get('approach_segments') and ctrl.get('junction_segments'):
+            recovered_approaches = set()
+            for sid in ctrl['junction_segments']:
+                if sid in adjacency:
+                    for succ in adjacency[sid].get('to', []):
+                        turns_cands = []
+                        merges_cands = []
+                        for cand_id, cand_adj in adjacency.items():
+                            if cand_id == sid:
+                                continue
+                            if succ in cand_adj.get('turns_into', []):
+                                turns_cands.append(cand_id)
+                            if succ in cand_adj.get('merges_into', []):
+                                merges_cands.append(cand_id)
+                        
+                        if turns_cands:
+                            recovered_approaches.update(turns_cands)
+                        elif merges_cands:
+                            recovered_approaches.update(merges_cands)
+            
+            for cand in recovered_approaches:
+                if cand not in ctrl['junction_segments']:
+                    ctrl['approach_segments'].append(cand)
+                    junctions_logger.info(f"Recovered approach segment {cand} for isolated standalone controller {ctrl_id}.")
+
+    # ------------------------------------------------------------------
+    # Step 5e Merge standalone controllers sharing the exact same single approach segment
+    # ------------------------------------------------------------------
+    approach_to_ctrls = {}
+    for ctrl_id, ctrl in controllers.items():
+        if ctrl.get('source') == 'standalone_signal' and len(ctrl.get('approach_segments', [])) == 1:
+            app_sid = ctrl['approach_segments'][0]
+            approach_to_ctrls.setdefault(app_sid, []).append(ctrl_id)
+            
+    for app_sid, ctrl_ids in approach_to_ctrls.items():
+        if len(ctrl_ids) > 1:
+            raw_osm_signals = []
+            junction_segs = set()
+            osm_node_ids = []
+            xs = []
+            ys = []
+            
+            for cid in ctrl_ids:
+                ctrl = controllers[cid]
+                raw_osm_signals.extend(ctrl['raw_osm_signals'])
+                junction_segs.update(ctrl.get('junction_segments', []))
+                for sig in ctrl['raw_osm_signals']:
+                    osm_node_ids.append(sig['osm_node_id'])
+                    xs.append(sig['x_utm'])
+                    ys.append(sig['y_utm'])
+                    
+            sorted_ids = sorted(set(osm_node_ids))
+            id_str = ','.join(str(x) for x in sorted_ids)
+            new_controller_id = hashlib.sha1(id_str.encode()).hexdigest()[:12]
+            
+            centroid_utm = Point(np.mean(xs), np.mean(ys))
+            centroid_ll = gpd.GeoDataFrame(
+                geometry=[centroid_utm], crs=edges.crs
+            ).to_crs("EPSG:4326").geometry.iloc[0]
+
+            junction_centroid = {
+                'lon': centroid_ll.x, 'lat': centroid_ll.y,
+                'x_utm': centroid_utm.x, 'y_utm': centroid_utm.y,
+            }
+            
+            new_ctrl = {
+                'controller_id': new_controller_id,
+                'junction_id': None,
+                'approach_segments': [app_sid],
+                'junction_segments': list(junction_segs),
+                'raw_osm_signals': raw_osm_signals,
+                'signal_count': len(raw_osm_signals),
+                'junction_centroid': junction_centroid,
+                'source': 'standalone_signal',
+            }
+            
+            for cid in ctrl_ids:
+                del controllers[cid]
+                
+            controllers[new_controller_id] = new_ctrl
+            junctions_logger.info(f"Merged {len(ctrl_ids)} standalone controllers sharing single approach {app_sid} into new controller {new_controller_id}.")
 
     # ------------------------------------------------------------------
     # Step 6  Write back to edges
@@ -1124,7 +1200,7 @@ def split_multi_signal_segments(edges, adjacency, config):
       - the segment has a single signal within 10m of its start (split 3.5m
         past that signal so the short piece becomes a junction link via
         classify_junctions), provided the remaining piece is not also very
-        short (e.g., < classify_max_length_m), or
+        short (e.g., < classify_max_length_m), or the 
       - the segment is > 50m long and has a single signal in the middle
         (not at the front and not near the end).
     """
@@ -1145,6 +1221,11 @@ def split_multi_signal_segments(edges, adjacency, config):
         if not is_oneway:
             continue
 
+        # Skip _link segments unless they are more than 50 meters long
+        highway = str(row.get('highway', ''))
+        if highway.endswith('_link') and row['length'] <= 50.0:
+            continue
+
         sig_pos_raw = row.get('signal_positions', "[]")
         try:
             sig_positions = json.loads(sig_pos_raw)
@@ -1162,12 +1243,12 @@ def split_multi_signal_segments(edges, adjacency, config):
             # Safety check: ensure split is within geometry and before the second signal
             if d_split >= row['length'] - 2.0 or d_split >= sig_positions[1]:
                 d_split = None
-        elif len(sig_positions) == 1 and d1 <= 10.0:
+        elif len(sig_positions) == 1 and d1 <= config.get("single_signal_split_threshold", 15.0):
             d_split = d1 + offset
             # Skip if the remaining segment would be too short (< classify_max_length_m)
             if d_split >= row['length'] - config.get("classify_max_length_m", 15.0):
                 d_split = None
-        elif len(sig_positions) == 1 and row['length'] > 50.0 and d1 > 10.0:
+        elif len(sig_positions) == 1 and row['length'] > 50.0 and 0.20 <= (d1 / row['length']) <= 0.80:
             d_split = d1 + offset
             # Skip if the remaining segment would be too short (meaning signal is near the end)
             if d_split >= row['length'] - config.get("classify_max_length_m", 15.0):
@@ -3166,7 +3247,7 @@ def main():
             'primary', 'secondary', 'trunk', 'motorway', 
             'primary_link', 'secondary_link', 'trunk_link', 'motorway_link'
         ],
-        "classify_max_area_sqm": 500.0,
+        "classify_max_area_sqm": 350.0,
         "classify_max_length_m": 18.0,
         "classify_shape_max_length_m": 35.0,
         "classify_min_intersection_length": 1e-5,
@@ -3174,6 +3255,8 @@ def main():
         "junction_max_depth": 10,
         "network_path": "osm_network.gpkg",
         "signal_endpoint_tolerance": 1.0,
+        "signal_split_offset": 3.5,
+        "single_signal_split_threshold": 15.0,
         "controller_junction_tolerance": 5.0
     }
     
