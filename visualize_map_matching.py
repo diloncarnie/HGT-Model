@@ -37,6 +37,8 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
     
     if 'is_outlier' not in df.columns:
         df['is_outlier'] = False
+    if 'dist_to_controller' not in df.columns:
+        df['dist_to_controller'] = np.nan
     df.loc[df['is_outlier'] == True, 'assigned_color'] = 'Outlier'
     df['track_id_str'] = df['track_id'].astype(str)
     
@@ -77,6 +79,7 @@ def visualize_map_matching(network_file, trajectory_file, test=False):
             "t_proj": ":.2f",
             "prop_dist": ":.3f",
             "rel_heading": ":.2f",
+            "dist_to_controller": ":.2f",
             "is_outlier": True,
             "assigned_color": False,
             "lat": False,

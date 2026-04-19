@@ -99,7 +99,7 @@ def visualize_adjacency(network_file, adjacency_file):
         adjacency = json.load(f)
 
     # Load controllers for controller-aware visualization
-    controllers_path = os.path.join(os.path.dirname(adjacency_file) or '.', 'controllers.json')
+    controllers_path = os.path.join(os.path.dirname(network_file) or '.', 'controllers.json')
     controllers = {}
     if os.path.exists(controllers_path):
         with open(controllers_path, 'r') as f:

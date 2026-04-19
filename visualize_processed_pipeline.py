@@ -21,6 +21,43 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
     if edges.crs != "EPSG:4326":
         edges = edges.to_crs("EPSG:4326")
 
+    # Load controllers.json for traffic lights and controller centroids
+    controllers_file = os.path.join(os.path.dirname(network_file), 'controllers.json')
+    controllers = {}
+    if os.path.exists(controllers_file):
+        with open(controllers_file, 'r') as f:
+            controllers = json.load(f)
+        print(f"Loaded {len(controllers)} signal controllers from {controllers_file}.")
+    else:
+        print(f"Warning: controllers.json not found at {controllers_file}. Signals will not be shown.")
+
+    signal_lats, signal_lons, signal_hover = [], [], []
+    centroid_lats, centroid_lons, centroid_hover, centroid_ids = [], [], [], []
+
+    for ctrl_id, ctrl in controllers.items():
+        for sig in ctrl.get('raw_osm_signals', []):
+            signal_lats.append(sig['lat'])
+            signal_lons.append(sig['lon'])
+            signal_hover.append(
+                f"Traffic signal on segment {sig.get('hosted_on_segment', '?')} "
+                f"(Controller: {ctrl_id})"
+            )
+            
+        jc = ctrl.get('junction_centroid')
+        if jc:
+            centroid_lats.append(jc['lat'])
+            centroid_lons.append(jc['lon'])
+            centroid_ids.append(ctrl_id)
+            n_approach = len(ctrl.get('approach_segments', []))
+            n_signals = ctrl.get('signal_count', 0)
+            centroid_hover.append(
+                f"<b>Controller {ctrl_id}</b><br>"
+                f"Source: {ctrl.get('source', '?')}<br>"
+                f"Signals: {n_signals}<br>"
+                f"Approaches: {n_approach}<br>"
+                f"Segments: {', '.join(ctrl.get('approach_segments', []))}"
+            )
+
     processed_dfs = []
     matched_dfs = []
 
@@ -56,7 +93,7 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         
                 if os.path.exists(match_file):
                     print(f"  Loading {match_file}...")
-                    df_m = pd.read_csv(match_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier'])
+                    df_m = pd.read_csv(match_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier', 'is_parked'])
                     # Filter out processed vehicles for this specific folder
                     df_m = df_m[~df_m['track_id'].isin(all_processed)]
                     df_m['track_id'] = df_m['track_id'].astype(str) + f"_{folder_name}"
@@ -103,21 +140,26 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
             df_matched = pd.DataFrame()
         else:
             print(f"Loading matched trajectories from {matched_file}...")
-            df_matched = pd.read_csv(matched_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier'])
+            df_matched = pd.read_csv(matched_file, usecols=lambda c: c in ['track_id', 'time', 'lat', 'lon', 'is_outlier', 'is_parked'])
             # Filter out processed vehicles
             df_matched = df_matched[~df_matched['track_id'].isin(all_processed)]
             df_matched['track_id'] = df_matched['track_id'].astype(str)
 
     if 'is_outlier' not in df.columns:
         df['is_outlier'] = False
+    if 'is_parked' not in df.columns:
+        df['is_parked'] = False
 
     # ----------------------------------------------------
     # Downsample matched trajectories for grey points
     # ----------------------------------------------------
     df_matched_outliers = pd.DataFrame()
+    df_matched_parked = pd.DataFrame()
     if not df_matched.empty:
         if 'is_outlier' not in df_matched.columns:
             df_matched['is_outlier'] = False
+        if 'is_parked' not in df_matched.columns:
+            df_matched['is_parked'] = False
             
         df_matched['time_window_sec'] = (df_matched['time'] // time_window) * time_window
         
@@ -131,6 +173,9 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
             print("Visualizing 100% of background trajectories.")
 
         print("Downsampling matched trajectories (grey points)...")
+        df_matched_parked = df_matched[df_matched['is_parked']].copy()
+        df_matched = df_matched[~df_matched['is_parked']].copy()
+        
         df_matched_outliers = df_matched[df_matched['is_outlier']].copy()
         df_matched = df_matched[~df_matched['is_outlier']].copy()
         
@@ -140,6 +185,10 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         if not df_matched_outliers.empty:
             df_matched_outliers = df_matched_outliers.groupby(['time_window_sec', 'track_id']).first().reset_index()
             df_matched_outliers['time_window_str'] = df_matched_outliers['time_window_sec'].astype(int).astype(str) + "s"
+
+        if not df_matched_parked.empty:
+            df_matched_parked = df_matched_parked.groupby(['time_window_sec', 'track_id']).first().reset_index()
+            df_matched_parked['time_window_str'] = df_matched_parked['time_window_sec'].astype(int).astype(str) + "s"
 
     # ----------------------------------------------------
     # Process CAV Data
@@ -161,6 +210,9 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
     # Group timestamps into buckets for the animation frame
     df['time_window_sec'] = (df['time'] // time_window) * time_window
 
+    df_parked = df[df['is_parked']].copy()
+    df = df[~df['is_parked']].copy()
+
     df_outliers = df[df['is_outlier']].copy()
     df = df[~df['is_outlier']].copy()
 
@@ -176,11 +228,22 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         df_outliers = df_outliers.sort_values(['time_window_sec', 'time'])
         df_outliers['time_window_str'] = df_outliers['time_window_sec'].astype(int).astype(str) + "s"
 
+    if not df_parked.empty:
+        df_parked = df_parked.groupby(['time_window_sec', 'track_id']).first().reset_index()
+        df_parked = df_parked.sort_values(['time_window_sec', 'time'])
+        df_parked['time_window_str'] = df_parked['time_window_sec'].astype(int).astype(str) + "s"
+        
     all_outliers = pd.concat([df_outliers, df_matched_outliers], ignore_index=True) if not df_outliers.empty or not df_matched_outliers.empty else pd.DataFrame()
     outlier_frames = {}
     if not all_outliers.empty:
         for t_str, group in all_outliers.groupby('time_window_str'):
             outlier_frames[str(t_str)] = group
+    
+    all_parked = pd.concat([df_parked, df_matched_parked], ignore_index=True) if not df_parked.empty or not df_matched_parked.empty else pd.DataFrame()
+    parked_frames = {}
+    if not all_parked.empty:
+        for t_str, group in all_parked.groupby('time_window_str'):
+            parked_frames[str(t_str)] = group
 
     # ----------------------------------------------------
     # Synchronize Timeline (Union of all buckets)
@@ -191,6 +254,8 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         all_buckets_set |= set(df_matched['time_window_sec'].unique())
     if not all_outliers.empty:
         all_buckets_set |= set(all_outliers['time_window_sec'].unique())
+    if not all_parked.empty:
+        all_buckets_set |= set(all_parked['time_window_sec'].unique())
         
     all_buckets = sorted(list(all_buckets_set))
     existing_cav_buckets = set(df['time_window_sec'].unique())
@@ -235,6 +300,7 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         "raw_density_rightwards_proceeding": True,
         "raw_density_rightwards_following": True,
         "is_outlier": True,
+        "is_parked": True,
         # Relative Speeds
         "relative_speed_proceeding": ":.2f",
         "relative_speed_following": ":.2f",
@@ -288,6 +354,29 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
         showlegend=False
     )
     
+    signal_markers = go.Scattermap(
+        lat=signal_lats,
+        lon=signal_lons,
+        mode='markers',
+        marker=dict(size=8, color='red', symbol='circle'),
+        text=signal_hover,
+        hoverinfo='text',
+        name=f'Traffic Signals ({len(signal_lats)})',
+        showlegend=True
+    )
+
+    controller_centroids = go.Scattermap(
+        lat=centroid_lats,
+        lon=centroid_lons,
+        mode='markers',
+        marker=dict(size=18, color='gold', symbol='circle', opacity=0.7),
+        text=centroid_hover,
+        customdata=centroid_ids,
+        hoverinfo='text',
+        name=f'Controllers ({len(centroid_lats)})',
+        showlegend=True,
+    )
+
     # Pre-calculate grey groups
     grey_frames = {}
     if not df_matched.empty:
@@ -325,7 +414,20 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
                 lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
             )
         
-        frame.data = [grey_trace, outlier_trace] + list(frame.data)
+        if frame_time in parked_frames:
+            g_parked = parked_frames[frame_time]
+            parked_trace = go.Scattermap(
+                lat=g_parked['lat'], lon=g_parked['lon'], mode='markers',
+                marker=dict(size=8, color='blue', opacity=0.9),
+                hovertext=g_parked['track_id'].astype(str) + " (Parked)",
+                hoverinfo='text', showlegend=False
+            )
+        else:
+            parked_trace = go.Scattermap(
+                lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
+            )
+        
+        frame.data = [grey_trace, outlier_trace, parked_trace] + list(frame.data)
 
     # Prepare initial trace state
     first_frame_name = df['time_window_str'].iloc[0] if not df.empty else ""
@@ -357,22 +459,41 @@ def visualize_processed_pipeline(network_file, input_path, show_all=False, time_
             lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
         )
 
+    if first_frame_name in parked_frames:
+        g_parked = parked_frames[first_frame_name]
+        initial_parked_trace = go.Scattermap(
+            lat=g_parked['lat'], lon=g_parked['lon'], mode='markers',
+            marker=dict(size=8, color='blue', opacity=0.9),
+            hovertext=g_parked['track_id'].astype(str) + " (Parked)",
+            hoverinfo='text', showlegend=False
+        )
+    else:
+        initial_parked_trace = go.Scattermap(
+            lat=[], lon=[], mode='markers', hoverinfo='skip', showlegend=False
+        )
+
     # Ensure background map is below the points
     fig.add_trace(bg_roads)
+    fig.add_trace(signal_markers)
+    fig.add_trace(controller_centroids)
     fig.add_trace(initial_grey_trace)
     fig.add_trace(initial_outlier_trace)
+    fig.add_trace(initial_parked_trace)
 
-    # Reorder initial traces: [Background Roads (0), Grey Points (1), White Outliers (2), CAV Heatmap (3+)]
+    # Reorder initial traces: [Background Roads (0), Signals (1), Controllers (2), Grey Points (3), White Outliers (4), Blue Parked (5), CAV Heatmap (6+)]
     data_list = list(fig.data)
-    fig.data = tuple([data_list[-3], data_list[-2], data_list[-1]] + data_list[:-3])
-    cav_traces = data_list[:-3]
+    fig.data = tuple(data_list[-6:] + data_list[:-6])
+    cav_traces = data_list[:-6]
     
     # Explicitly set marker size for CAVs and other points to 8
     fig.update_traces(marker=dict(size=8), selector=dict(mode='markers'))
     
+    # Restore controller marker size
+    fig.update_traces(marker=dict(size=18), selector=dict(name=f'Controllers ({len(centroid_lats)})'))
+    
     # If px generated multiple traces for some reason, we update the frame.traces to match
     for frame in fig.frames:
-        frame.traces = [1, 2] + list(range(3, 3 + len(cav_traces)))
+        frame.traces = [3, 4, 5] + list(range(6, 6 + len(cav_traces)))
 
     html_file = "pipeline_features_viz.html"
     print(f"Saving visualization to {html_file}...")

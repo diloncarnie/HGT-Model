@@ -188,6 +188,9 @@ def process_single_folder(folder_path, config):
         print("Matched trajectories file is empty.")
         return
         
+    if 'is_parked' not in df.columns:
+        df['is_parked'] = False
+        
     with open(thresh_file, 'r') as f:
         segment_thresholds = json.load(f)
         
@@ -284,7 +287,7 @@ def process_single_folder(folder_path, config):
         'track_id', 'type', 'traveled_distance', 'avg_speed', 'lat', 'lon', 'speed', 'long_acc', 'lat_acc', 'time',
         'segment_id', 'segment_length', 'segment_type', 'num_lanes', 'lane_index', 'proportionate_distance_travelled',
         'change_in_euclidean_distance', 'relative_time_gap', 'relative_kinematic_ratio',
-        'segment_free_flow_speed', 'relative_ego_speed', 'is_outlier'
+        'segment_free_flow_speed', 'relative_ego_speed', 'is_outlier', 'is_parked'
     ]
     
     for z in ['proceeding', 'following', 'leftwards_proceeding', 'leftwards_following', 'rightwards_proceeding', 'rightwards_following']:
