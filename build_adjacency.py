@@ -8,7 +8,9 @@ import os
 import numpy as np
 import requests
 import ast
-from shapely.geometry import LineString, Polygon, MultiPolygon
+from shapely.geometry import LineString, Polygon, MultiPolygon, Point
+from shapely.strtree import STRtree
+import hashlib
 import time
 import logging
 
@@ -25,6 +27,26 @@ def setup_logger(name, log_file):
         l.addHandler(ch)
     return l
 
+def cut_line_at_distance(line, distance):
+    """
+    Cuts a Shapely LineString into two pieces at a specific distance from its start.
+    Returns (line_a, line_b).
+    """
+    if distance <= 0.0:
+        return None, line
+    if distance >= line.length:
+        return line, None
+        
+    coords = list(line.coords)
+    for i, p in enumerate(coords):
+        pd = line.project(Point(p))
+        if pd == distance:
+            return LineString(coords[:i+1]), LineString(coords[i:])
+        if pd > distance:
+            cp = line.interpolate(distance)
+            return LineString(coords[:i] + [cp]), LineString([cp] + coords[i:])
+    return line, None
+
 logger = setup_logger("build_adjacency", "build-adjacency.log")
 turn_restrictions_logger = setup_logger("turn_restrictions", "turn_restrictions.log")
 junctions_logger = setup_logger("junctions", "junction_detections.log")
@@ -32,9 +54,9 @@ junctions_logger = setup_logger("junctions", "junction_detections.log")
 def get_osm_network(bbox, config):
     # Instruct OSMnx to retain advanced routing and road rule tags
     ox.settings.useful_tags_way += ['turn:lanes', 'turn', 'junction', 'access']
-    
-    logger.info(f"Downloading OSM network for bounding box: {bbox}...")
-    # Download using the provided bounding box
+    ox.settings.useful_tags_node += ['traffic_signals:direction', 'crossing']
+
+    logger.info(f"Downloading OSM network for bounding box: {bbox}...")    # Download using the provided bounding box
     graph = ox.graph_from_bbox(bbox=bbox, network_type='all', simplify=False)
 
     valid_highway_types = config["valid_highway_types"]
@@ -114,12 +136,58 @@ def get_osm_network(bbox, config):
                                 d_in['lanes'] = d_out['lanes']
                                 changed = True
                                 
+    # Capture signal nodes with OSM IDs BEFORE simplification. ox.simplify_graph
+    # collapses degree-2 nodes, which silently removes signals that lie mid-road on
+    # a single way. We keep the OSM node ID for stable controller_id hashing later.
+    signal_nodes_raw = []
+    for n, d in filtered_graph.nodes(data=True):
+        hw = str(d.get('highway', ''))
+        crossing = str(d.get('crossing', ''))
+        has_hw = 'traffic_signals' in hw
+        has_cr = 'traffic_signals' in crossing
+        if has_hw or has_cr:
+            sig_type = 'highway' if has_hw else 'crossing'
+            signal_nodes_raw.append((n, d['x'], d['y'], d.get('traffic_signals:direction'), sig_type))
+
     filtered_graph = ox.simplify_graph(filtered_graph, edge_attrs_differ=['lanes'])
     graph_utm = ox.project_graph(filtered_graph)
-    
+
     nodes, edges = ox.graph_to_gdfs(graph_utm)
     edges = edges.reset_index()
     edges['segment_id'] = edges.index.astype(str)
+
+    # Project the pre-simplification signal points into the final edges CRS so the
+    # spatial query in tag_signals_at_end compares like-for-like coordinates.
+    # Each entry carries its OSM node ID for controller_id hashing downstream.
+    if signal_nodes_raw:
+        sig_gdf = gpd.GeoDataFrame(
+            [{'osm_node_id': int(n), 'ts_direction': str(dir), 'sig_type': str(stype)} for n, _, _, dir, stype in signal_nodes_raw],
+            geometry=[Point(lon, lat) for _, lon, lat, _, _ in signal_nodes_raw],
+            crs="EPSG:4326"
+        ).to_crs(edges.crs)
+        
+        signal_data = []
+        seen_locations = set()
+        for idx, row in sig_gdf.iterrows():
+            if row.geometry is not None:
+                loc_key = (round(row.geometry.x, 5), round(row.geometry.y, 5))
+                if loc_key in seen_locations:
+                    continue
+                seen_locations.add(loc_key)
+
+                signal_data.append({
+                    'osm_node_id': int(signal_nodes_raw[idx][0]),
+                    'lon': float(signal_nodes_raw[idx][1]),
+                    'lat': float(signal_nodes_raw[idx][2]),
+                    'ts_direction': signal_nodes_raw[idx][3],
+                    'sig_type': signal_nodes_raw[idx][4],
+                    'x_utm': float(row.geometry.x),
+                    'y_utm': float(row.geometry.y),
+                    'geometry': row.geometry
+                })
+    else:
+        signal_data = []
+    logger.info(f"Found {len(signal_data)} traffic signal nodes in OSM bbox (pre-simplification).")
     
     if 'length' not in edges.columns:
         edges['length'] = edges.geometry.length
@@ -162,7 +230,1043 @@ def get_osm_network(bbox, config):
         
     edges['lanes'] = edges.apply(adjust_lanes, axis=1)
 
-    return edges
+    return edges, signal_data
+
+def tag_signals_at_end(edges, signal_data, adjacency, tolerance=1.0):
+    """
+    Associates traffic signals to segments in multiple passes to handle overlapping
+    or redundant signals effectively:
+      1) Assign 'highway' traffic signals first, applying backward filters.
+      2) Assign 'crossing' traffic signals, skipping them if they fall within 10m 
+         of any existing traffic signal already assigned to the same segment.
+      3) Final pass: skip crossing signals that fall within 10m of the segment
+         start IF their topological predecessor already has a signal at its end.
+         
+    Returns (edges, filtered_signal_data) where filtered_signal_data only
+    contains the valid signals to be used by the controller builder.
+    """
+    edges['signal_at_end'] = False
+    edges['signal_positions'] = "[]"
+    
+    if not signal_data:
+        return edges, signal_data
+
+    edge_geoms = edges.geometry.tolist()
+    edge_sids = edges['segment_id'].astype(str).tolist()
+    
+    def is_reversed(val):
+        if isinstance(val, list):
+            val = val[0]
+        return str(val).lower() in ['true', 'yes', '1']
+        
+    edge_revs = [is_reversed(x) for x in edges.get('reversed', pd.Series([False]*len(edges)))]
+    edge_oneways = [str(x).lower() in ['true', 'yes', '1'] for x in edges.get('oneway', pd.Series(['False']*len(edges)))]
+    edge_lengths = edges['length'].tolist()
+    
+    edge_tree = STRtree(edge_geoms)
+    
+    # Store assigned positions for each segment: sid -> [pos, ...]
+    edge_signals = {sid: [] for sid in edge_sids}
+    valid_signals = []
+    
+    def get_best_candidate(sig_pt, ts_dir):
+        candidate_idxs = edge_tree.query(sig_pt.buffer(tolerance))
+        candidates = []
+        for edge_idx in candidate_idxs:
+            geom = edge_geoms[int(edge_idx)]
+            if geom is None or geom.is_empty: continue
+            d = geom.distance(sig_pt)
+            if d <= tolerance:
+                pos = float(geom.project(sig_pt))
+                candidates.append({
+                    'edge_idx': int(edge_idx),
+                    'sid': edge_sids[int(edge_idx)],
+                    'dist': d,
+                    'pos': pos,
+                    'length': edge_lengths[int(edge_idx)],
+                    'reversed': edge_revs[int(edge_idx)],
+                    'is_oneway': edge_oneways[int(edge_idx)]
+                })
+                
+        best_candidate = None
+        best_score = -float('inf')
+        for c in candidates:
+            # Apply backward filter for oneway segments
+            if 'backward' in ts_dir and c['is_oneway']:
+                continue
+            # Apply directional filters for two-way segments
+            if not c['is_oneway'] and ts_dir and ts_dir not in ['none', 'nan', 'null', '']:
+                if 'forward' in ts_dir and c['reversed']:
+                    continue
+                if 'backward' in ts_dir and not c['reversed']:
+                    continue
+                    
+            score = -c['dist'] * 10.0
+            pos_ratio = c['pos'] / c['length'] if c['length'] > 0 else 0.5
+            score += pos_ratio * 50.0 
+            
+            if score > best_score:
+                best_score = score
+                best_candidate = c
+                
+        return best_candidate
+
+    # Pass 1: Assign highway=traffic_signal nodes
+    highway_signals = [(idx, s) for idx, s in enumerate(signal_data) if str(s.get('sig_type')) == 'highway']
+    crossing_signals = [(idx, s) for idx, s in enumerate(signal_data) if str(s.get('sig_type')) == 'crossing']
+    
+    for idx, s in highway_signals:
+        sig_pt = s['geometry']
+        ts_dir = str(s.get('ts_direction', '')).lower()
+        
+        best_candidate = get_best_candidate(sig_pt, ts_dir)
+        if best_candidate is None:
+            if 'backward' in ts_dir:
+                logger.info(
+                    f"Skipped backward highway signal (OSM node {s['osm_node_id']}) "
+                    f"as no valid segment was found"
+                )
+            continue
+            
+        s['hosted_on_segment'] = best_candidate['sid']
+        s['position_along_host_m'] = best_candidate['pos']
+        valid_signals.append(s)
+        edge_signals[best_candidate['sid']].append(best_candidate['pos'])
+
+    # Lookup to track segments with signals from Pass 1
+    signal_at_end_lookup = {sid: bool(pos_list) for sid, pos_list in edge_signals.items()}
+
+    # Pass 2: Assign crossing=traffic_signal nodes
+    for idx, s in crossing_signals:
+        sig_pt = s['geometry']
+        ts_dir = str(s.get('ts_direction', '')).lower()
+        
+        best_candidate = get_best_candidate(sig_pt, ts_dir)
+        if best_candidate is None:
+            if 'backward' in ts_dir:
+                logger.info(
+                    f"Skipped backward crossing signal (OSM node {s['osm_node_id']}) "
+                    f"as no valid segment was found"
+                )
+            continue
+            
+        sid = best_candidate['sid']
+        pos = best_candidate['pos']
+        length = best_candidate['length']
+        
+        too_close = False
+        for p in edge_signals.get(sid, []):
+            if abs(pos - p) <= 15.0:
+                too_close = True
+                break
+        
+        # Skip if this crossing signal is within 10m of an already assigned signal
+        if too_close:
+            logger.info(
+                f"Skipped crossing signal (OSM node {s['osm_node_id']}) "
+                f"as it is within 10m of an existing signal on segment {sid}."
+            )
+            continue
+            
+        s['hosted_on_segment'] = sid
+        s['position_along_host_m'] = pos
+        valid_signals.append(s)
+        edge_signals[sid].append(pos)
+        signal_at_end_lookup[sid] = True
+
+    # Pass 3: Check for Invalid Crossing traffic signals as the final pass.
+    final_valid_signals = []
+    for s in valid_signals:
+        if str(s.get('sig_type')) == 'crossing':
+            sid = s.get('hosted_on_segment')
+            pos = s.get('position_along_host_m')
+            
+            if sid and pos is not None and pos <= 10.0:
+                is_invalid = False
+                if sid in adjacency:
+                    for pred_sid in adjacency[sid].get('from', []):
+                        if signal_at_end_lookup.get(str(pred_sid), False):
+                            is_invalid = True
+                            break
+                            
+                if is_invalid:
+                    logger.info(
+                        f"Skipped invalid crossing signal (OSM node {s['osm_node_id']}) "
+                        f"as it is close to start of {sid} which already has a signal at the end of its predecessor."
+                    )
+                    # Remove it from edge_signals
+                    if pos in edge_signals[sid]:
+                        edge_signals[sid].remove(pos)
+                        if not edge_signals[sid]:
+                            signal_at_end_lookup[sid] = False
+                    continue
+                    
+        final_valid_signals.append(s)
+
+    # Write back to edges dataframe
+    sig_at_end_flags = []
+    sig_positions_list = []
+    n_end = 0
+    n_mid = 0
+    
+    for idx, row in edges.iterrows():
+        sid = str(row['segment_id'])
+        positions = edge_signals.get(sid, [])
+        positions.sort()
+        
+        sig_positions_list.append(json.dumps(positions))
+        
+        has_any = bool(positions)
+        sig_at_end_flags.append(has_any)
+        
+        if has_any:
+            # Check if at terminal vertex
+            geom = row.geometry
+            if geom and not geom.is_empty:
+                end_pt = Point(list(geom.coords)[-1])
+                is_terminal = False
+                for p in positions:
+                    if geom.length - p <= tolerance:
+                        is_terminal = True
+                        break
+                if is_terminal:
+                    n_end += 1
+                else:
+                    n_mid += 1
+
+    edges['signal_at_end'] = sig_at_end_flags
+    edges['signal_positions'] = sig_positions_list
+    
+    logger.info(
+        f"Tagged {n_end} edges with signal_at_end=True and {n_mid} additional "
+        f"edges with mid-segment signals (tolerance {tolerance} m)."
+    )
+
+    return edges, final_valid_signals
+
+
+def build_controllers(edges, signal_data, adjacency, config):
+    """Build one logical signal controller per signalized junction.
+
+    Produces a ``controllers`` dict keyed by a stable ``controller_id``
+    (sha1-12 of sorted OSM signal node IDs for junction controllers, or
+    ``s_<osm_node_id>`` for standalone mid-block signals) and writes
+    ``controller_id`` / ``controller_role`` columns back onto *edges*.
+
+    Returns ``(controllers_dict, edges)``.
+    """
+    import networkx as nx
+    from shapely.ops import polygonize
+    from shapely.geometry import MultiPoint
+
+    tolerance = config.get("signal_endpoint_tolerance", 1.0)
+    junction_tolerance = config.get("controller_junction_tolerance", 5.0)
+
+    logger.info("Building signal controllers...")
+
+    # Initialize output columns
+    edges = edges.copy()
+    edges['controller_id'] = ""
+    edges['controller_role'] = ""
+
+    if not signal_data:
+        logger.info("No signal data available; skipping controller construction.")
+        return {}, edges
+
+    # ------------------------------------------------------------------
+    # Step 2  Attach each signal to its hosted segment
+    # ------------------------------------------------------------------
+    signal_points = [s['geometry'] for s in signal_data]
+    edge_geoms = edges.geometry.tolist()
+    edge_sids = edges['segment_id'].astype(str).tolist()
+    
+    signal_at_end_lookup = {
+        str(sid): str(val).lower() == 'true' 
+        for sid, val in zip(edges['segment_id'], edges.get('signal_at_end', False))
+    }
+    
+    def is_reversed(val):
+        if isinstance(val, list):
+            val = val[0]
+        return str(val).lower() in ['true', 'yes', '1']
+        
+    edge_revs = [is_reversed(x) for x in edges['reversed'].tolist()] if 'reversed' in edges.columns else [False] * len(edges)
+    edge_oneways = [str(x).lower() in ['true', 'yes', '1'] for x in edges['oneway'].tolist()]
+    edge_lengths = edges['length'].tolist()
+    
+    edge_tree = STRtree(edge_geoms)
+
+    for sig_idx, sig_pt in enumerate(signal_points):
+        candidate_idxs = edge_tree.query(sig_pt.buffer(tolerance))
+        
+        candidates = []
+        for edge_idx in candidate_idxs:
+            geom = edge_geoms[int(edge_idx)]
+            if geom is None or geom.is_empty:
+                continue
+            d = geom.distance(sig_pt)
+            if d <= tolerance:
+                pos = float(geom.project(sig_pt))
+                candidates.append({
+                    'edge_idx': int(edge_idx),
+                    'sid': edge_sids[int(edge_idx)],
+                    'dist': d,
+                    'pos': pos,
+                    'length': edge_lengths[int(edge_idx)],
+                    'reversed': edge_revs[int(edge_idx)],
+                    'is_oneway': edge_oneways[int(edge_idx)]
+                })
+                
+        if not candidates:
+            signal_data[sig_idx]['hosted_on_segment'] = None
+            signal_data[sig_idx]['position_along_host_m'] = None
+            continue
+            
+        ts_dir = str(signal_data[sig_idx].get('ts_direction', '')).lower()
+        
+        best_candidate = None
+        best_score = -float('inf')
+        
+        for c in candidates:
+            # First apply the backward filter on oneway=true segments
+            if 'backward' in ts_dir and c['is_oneway']:
+                continue
+                
+            # Then assign traffic lights on oneway=false segments based on their direction
+            if not c['is_oneway'] and ts_dir and ts_dir not in ['none', 'nan', 'null', '']:
+                if 'forward' in ts_dir and c['reversed']:
+                    continue
+                if 'backward' in ts_dir and not c['reversed']:
+                    continue
+
+            score = -c['dist'] * 10.0
+            
+            # Heuristic: traffic lights are near the END of the segment (entering intersection)
+            if c['length'] > 0:
+                pos_ratio = c['pos'] / c['length']
+            else:
+                pos_ratio = 0.5
+                
+            score += pos_ratio * 50.0 
+            
+            if score > best_score:
+                best_score = score
+                best_candidate = c
+                
+        if best_candidate is None:
+            signal_data[sig_idx]['hosted_on_segment'] = None
+            signal_data[sig_idx]['position_along_host_m'] = None
+            if 'backward' in ts_dir:
+                logger.info(
+                    f"Skipped backward signal {sig_idx} (OSM node "
+                    f"{signal_data[sig_idx]['osm_node_id']}) as no valid segment was found"
+                )
+            continue
+
+        signal_data[sig_idx]['hosted_on_segment'] = best_candidate['sid']
+        signal_data[sig_idx]['position_along_host_m'] = best_candidate['pos']
+
+    # segment -> [signal indices]
+    seg_to_signals = {}
+    for sig_idx, sd in enumerate(signal_data):
+        host = sd.get('hosted_on_segment')
+        if host:
+            seg_to_signals.setdefault(host, []).append(sig_idx)
+
+    # ------------------------------------------------------------------
+    # Step 3  Identify signalized junctions via junction groupings
+    # ------------------------------------------------------------------
+    junction_mask = edges['is_internal_junction'].astype(str).str.lower() == 'true'
+    junction_edges_gdf = edges[junction_mask]
+
+    # Quick segment lookup
+    seg_lookup = {}
+    for _, row in edges.iterrows():
+        seg_lookup[str(row['segment_id'])] = row
+
+    # Connected components of internal-junction edges
+    G_junc = nx.MultiGraph()
+    for _, row in junction_edges_gdf.iterrows():
+        sid = str(row['segment_id'])
+        G_junc.add_edge(row['u'], row['v'], key=sid, segment_id=sid)
+
+    junction_groups = {}
+    seg_to_group = {}
+    for group_id, component in enumerate(nx.connected_components(G_junc)):
+        subgraph = G_junc.subgraph(component)
+        segment_ids = list({data['segment_id']
+                           for _, _, _, data in subgraph.edges(keys=True, data=True)})
+        junction_groups[group_id] = {
+            'junction_segments': segment_ids,
+            'nodes': set(component),
+        }
+        for sid in segment_ids:
+            seg_to_group[sid] = group_id
+
+    # Build junction polygons for spatial approach-segment detection
+    seen_pairs = set()
+    unique_junction_geoms = []
+    for _, row in junction_edges_gdf.iterrows():
+        key = frozenset((row['u'], row['v']))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        unique_junction_geoms.append(row.geometry)
+
+    junction_polys = list(polygonize(unique_junction_geoms))
+
+    # Assign each polygon to its junction group
+    group_polys = {}
+    for poly in junction_polys:
+        for group_id, group in junction_groups.items():
+            matched = False
+            for sid in group['junction_segments']:
+                row = seg_lookup.get(sid)
+                if row is not None and row.geometry is not None:
+                    if poly.boundary.intersection(row.geometry).length > 1e-5:
+                        if group_id not in group_polys:
+                            group_polys[group_id] = poly
+                        else:
+                            group_polys[group_id] = group_polys[group_id].union(poly)
+                        matched = True
+                        break
+            if matched:
+                break
+
+    # Fallback geometry for groups without polygons
+    for group_id, group in junction_groups.items():
+        if group_id not in group_polys:
+            node_coords = []
+            for sid in group['junction_segments']:
+                row = seg_lookup.get(sid)
+                if row is not None and row.geometry is not None:
+                    node_coords.extend(list(row.geometry.coords))
+            if len(node_coords) >= 3:
+                hull = MultiPoint(node_coords).convex_hull
+                group_polys[group_id] = hull if hull.area > 0 else hull.buffer(junction_tolerance)
+            elif node_coords:
+                group_polys[group_id] = MultiPoint(node_coords).convex_hull.buffer(junction_tolerance)
+
+    # ------------------------------------------------------------------
+    # Step 4  Find approach segments for each junction group
+    # ------------------------------------------------------------------
+    non_junction_edges = edges[~junction_mask]
+
+    # Pre-index: v-node -> non-junction segment IDs
+    v_to_non_junc_segs = {}
+    v_node_points = {}
+    for _, row in non_junction_edges.iterrows():
+        sid = str(row['segment_id'])
+        v_node = row['v']
+        v_to_non_junc_segs.setdefault(v_node, []).append(sid)
+        if v_node not in v_node_points and row.geometry is not None and not row.geometry.is_empty:
+            v_node_points[v_node] = Point(list(row.geometry.coords)[-1])
+
+    for group_id, group in junction_groups.items():
+        approach = set()
+        # Topological: v node is a junction-group node
+        for v_node in group['nodes']:
+            for sid in v_to_non_junc_segs.get(v_node, []):
+                approach.add(sid)
+        # Spatial: v point is within tolerance of junction polygon
+        group_poly = group_polys.get(group_id)
+        if group_poly is not None:
+            for v_node, v_pt in v_node_points.items():
+                if v_node not in group['nodes'] and group_poly.distance(v_pt) <= junction_tolerance:
+                    for sid in v_to_non_junc_segs.get(v_node, []):
+                        approach.add(sid)
+        group['approach_segments'] = list(approach)
+
+    # ------------------------------------------------------------------
+    # Step 4b  Reassign long boundary edges back to junction segments
+    # ------------------------------------------------------------------
+    # classify_junctions marks edges that lie on a junction polygon boundary
+    # but were excluded because their length exceeded classify_shape_max_length_m
+    # (is_long_shape_boundary=True). For shape-junction groups, any approach
+    # segment carrying that flag is actually part of the junction polygon and
+    # should be a junction link. We reassign it unless was_merged=True, which
+    # indicates the segment absorbed a neighbour in merge_short_segments or
+    # simplify_network_topology and should not be treated as a pure junction link.
+    newly_assigned_junction_sids = set()
+
+    has_long_boundary_col = 'is_long_shape_boundary' in edges.columns
+    has_merged_col = 'was_merged' in edges.columns
+
+    for group_id, group in junction_groups.items():
+        # Only consider groups built from shape-junction segments
+        has_shape = any(
+            str(seg_lookup[sid].get('is_shape_junction', 'False')).lower() == 'true'
+            for sid in group['junction_segments']
+            if sid in seg_lookup
+        )
+        if not has_shape:
+            continue
+
+        for sid in list(group['approach_segments']):
+            row = seg_lookup.get(sid)
+            if row is None:
+                continue
+            if not has_long_boundary_col or str(row.get('is_long_shape_boundary', 'False')).lower() != 'true':
+                continue
+            if str(row.get('is_internal_junction', 'False')).lower() == 'true':
+                continue
+            if has_merged_col and str(row.get('was_merged', 'False')).lower() == 'true':
+                continue
+
+            # Only reassign if the candidate actually closes the junction shape.
+            # Combine the group's existing junction segment geometries with the
+            # candidate and check whether polygonize produces a closed polygon.
+            seen_pairs = set()
+            geoms_without_candidate = []
+            for jsid in group['junction_segments']:
+                jrow = seg_lookup.get(jsid)
+                if jrow is None:
+                    continue
+                key = frozenset((jrow['u'], jrow['v']))
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                if jrow.geometry is not None and not jrow.geometry.is_empty:
+                    geoms_without_candidate.append(jrow.geometry)
+            
+            polys_without = list(polygonize(geoms_without_candidate))
+
+            cand_key = frozenset((row['u'], row['v']))
+            geoms_to_test = list(geoms_without_candidate)
+            if cand_key not in seen_pairs and row.geometry is not None and not row.geometry.is_empty:
+                geoms_to_test.append(row.geometry)
+            
+            polys_with = list(polygonize(geoms_to_test))
+
+            if len(polys_with) <= len(polys_without):
+                continue
+
+            newly_assigned_junction_sids.add(sid)
+            group['junction_segments'].append(sid)
+            group['approach_segments'].remove(sid)
+            seg_to_group[sid] = group_id
+            junctions_logger.info(
+                f"Reassigned long boundary segment {sid} "
+                f"(length {float(row.get('length', 0)):.1f}m) as junction link "
+                f"for group {group_id} (closes shape)."
+            )
+
+    if newly_assigned_junction_sids:
+        mask_new = edges['segment_id'].astype(str).isin(newly_assigned_junction_sids)
+        edges.loc[mask_new, 'is_internal_junction'] = 'True'
+        logger.info(
+            f"Reassigned {len(newly_assigned_junction_sids)} long boundary edge(s) "
+            f"as junction segments for shape-junction groups."
+        )
+
+    # Determine which groups are signalized
+    signalized_groups = {}
+    for group_id, group in junction_groups.items():
+        all_segs = set(group['junction_segments']) | set(group.get('approach_segments', []))
+        sig_indices = []
+        for sid in all_segs:
+            sigs = seg_to_signals.get(sid, [])
+            if not sigs:
+                continue
+            
+            # Skip _link roads with exactly one signal so they become standalone controllers
+            row = seg_lookup.get(sid)
+            if row is not None and str(row.get('highway', '')).endswith('_link') and len(sigs) == 1:
+                continue
+                
+            sig_indices.extend(sigs)
+        if sig_indices:
+            signalized_groups[group_id] = sig_indices
+
+    # ------------------------------------------------------------------
+    # Step 4b  Form controllers from signalized groups
+    # ------------------------------------------------------------------
+    controllers = {}
+    used_signals = set()
+
+    for group_id, sig_indices in signalized_groups.items():
+        group = junction_groups[group_id]
+
+        if len(sig_indices) == 1:
+            junctions_logger.info(f"Disqualified junction group {group_id} as a controller because it only has 1 signal.")
+            continue
+
+        raw_osm_signals = []
+        osm_node_ids = []
+        for si in sig_indices:
+            sd = signal_data[si]
+            raw_osm_signals.append({
+                'osm_node_id': sd['osm_node_id'],
+                'lon': sd['lon'], 'lat': sd['lat'],
+                'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
+                'hosted_on_segment': sd.get('hosted_on_segment'),
+                'position_along_host_m': sd.get('position_along_host_m'),
+            })
+            osm_node_ids.append(sd['osm_node_id'])
+            used_signals.add(si)
+
+        # Stable controller_id: sha1-12 of sorted OSM signal node IDs
+        sorted_ids = sorted(set(osm_node_ids))
+        id_str = ','.join(str(x) for x in sorted_ids)
+        controller_id = hashlib.sha1(id_str.encode()).hexdigest()[:12]
+
+        # Junction centroid
+        group_poly = group_polys.get(group_id)
+        if group_poly is not None:
+            centroid_utm = group_poly.centroid
+        else:
+            xs = [signal_data[i]['x_utm'] for i in sig_indices]
+            ys = [signal_data[i]['y_utm'] for i in sig_indices]
+            centroid_utm = Point(np.mean(xs), np.mean(ys))
+
+        centroid_ll = gpd.GeoDataFrame(
+            geometry=[centroid_utm], crs=edges.crs
+        ).to_crs("EPSG:4326").geometry.iloc[0]
+
+        junction_centroid = {
+            'lon': centroid_ll.x, 'lat': centroid_ll.y,
+            'x_utm': centroid_utm.x, 'y_utm': centroid_utm.y,
+        }
+
+        # controlled_crossed_by: limit crossed_by to same-controller approaches
+        approach_set = set(group.get('approach_segments', []))
+        controlled_crossed_by = {}
+        for a_sid in approach_set:
+            if a_sid in adjacency:
+                crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_set]
+                if crosses:
+                    controlled_crossed_by[a_sid] = crosses
+
+        # junction_id: pick a shape-junction segment or first junction segment
+        junction_id = None
+        for sid in group['junction_segments']:
+            row = seg_lookup.get(sid)
+            if row is not None and str(row.get('is_shape_junction', 'False')).lower() == 'true':
+                junction_id = sid
+                break
+        if junction_id is None and group['junction_segments']:
+            junction_id = group['junction_segments'][0]
+
+        controllers[controller_id] = {
+            'controller_id': controller_id,
+            'junction_id': junction_id,
+            'approach_segments': group.get('approach_segments', []),
+            'junction_segments': group['junction_segments'],
+            'controlled_crossed_by': controlled_crossed_by,
+            'raw_osm_signals': raw_osm_signals,
+            'signal_count': len(raw_osm_signals),
+            'junction_centroid': junction_centroid,
+            'source': 'junction_polygon',
+        }
+
+    # ------------------------------------------------------------------
+    # Step 5  Standalone signals (not absorbed by any junction)
+    # ------------------------------------------------------------------
+    standalone_groups = {}
+    ungrouped_signals = []
+
+    for sig_idx, sd in enumerate(signal_data):
+        if sig_idx in used_signals:
+            continue
+        
+        host_seg = sd.get('hosted_on_segment')
+        if host_seg and host_seg in seg_lookup:
+            row = seg_lookup[host_seg]
+            sigs = seg_to_signals.get(host_seg, [])
+            if str(row.get('highway', '')).endswith('_link') and len(sigs) == 1:
+                ungrouped_signals.append((sig_idx, sd))
+            else:
+                v_node = row['v']
+                standalone_groups.setdefault(v_node, []).append((sig_idx, sd))
+        else:
+            ungrouped_signals.append((sig_idx, sd))
+
+    for v_node, sig_list in standalone_groups.items():
+        if len(sig_list) == 1:
+            sig_idx, sd = sig_list[0]
+            osm_node_id = sd['osm_node_id']
+            controller_id = f"s_{osm_node_id}"
+            host_seg = sd.get('hosted_on_segment')
+            
+            approach_set = set(v_to_non_junc_segs.get(v_node, []))
+            if host_seg:
+                approach_set.add(host_seg)
+                if host_seg in adjacency:
+                    adj_ego = adjacency[host_seg]
+                    # Discard merge segments
+                    for s in adj_ego.get('merges_with', []):
+                        approach_set.discard(s)
+                    for s in adj_ego.get('merged_by', []):
+                        approach_set.discard(s)
+            approach_segments = list(approach_set)
+
+            raw_osm_signals = [{
+                'osm_node_id': sd['osm_node_id'],
+                'lon': sd['lon'], 'lat': sd['lat'],
+                'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
+                'hosted_on_segment': host_seg,
+                'position_along_host_m': sd.get('position_along_host_m'),
+            }]
+
+            sig_pt_ll = gpd.GeoDataFrame(
+                geometry=[sd['geometry']], crs=edges.crs
+            ).to_crs("EPSG:4326").geometry.iloc[0]
+
+            junction_centroid = {
+                'lon': sig_pt_ll.x, 'lat': sig_pt_ll.y,
+                'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
+            }
+
+            # controlled_crossed_by: limit crossed_by to same-controller approaches
+            controlled_crossed_by = {}
+            for a_sid in approach_segments:
+                if a_sid in adjacency:
+                    crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_segments]
+                    if crosses:
+                        controlled_crossed_by[a_sid] = crosses
+
+            controllers[controller_id] = {
+                'controller_id': controller_id,
+                'junction_id': None,
+                'approach_segments': approach_segments,
+                'junction_segments': [],
+                'controlled_crossed_by': controlled_crossed_by,
+                'raw_osm_signals': raw_osm_signals,
+                'signal_count': 1,
+                'junction_centroid': junction_centroid,
+                'source': 'standalone_signal',
+            }
+        else:
+            osm_node_ids = [sd['osm_node_id'] for _, sd in sig_list]
+            sorted_ids = sorted(set(osm_node_ids))
+            id_str = ','.join(str(x) for x in sorted_ids)
+            controller_id = hashlib.sha1(id_str.encode()).hexdigest()[:12]
+            
+            approach_set = set()
+            raw_osm_signals = []
+            xs, ys = [], []
+            for _, sd in sig_list:
+                host_seg = sd.get('hosted_on_segment')
+                if host_seg:
+                    approach_set.add(host_seg)
+                    if host_seg in adjacency:
+                        adj_ego = adjacency[host_seg]
+                        # Discard merge segments
+                        for s in adj_ego.get('merges_with', []):
+                            approach_set.discard(s)
+                        for s in adj_ego.get('merged_by', []):
+                            approach_set.discard(s)
+
+                raw_osm_signals.append({
+                    'osm_node_id': sd['osm_node_id'],
+                    'lon': sd['lon'], 'lat': sd['lat'],
+                    'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
+                    'hosted_on_segment': host_seg,
+                    'position_along_host_m': sd.get('position_along_host_m'),
+                })
+                xs.append(sd['x_utm'])
+                ys.append(sd['y_utm'])
+            approach_segments = list(approach_set)
+            
+            centroid_utm = Point(np.mean(xs), np.mean(ys))
+            centroid_ll = gpd.GeoDataFrame(
+                geometry=[centroid_utm], crs=edges.crs
+            ).to_crs("EPSG:4326").geometry.iloc[0]
+
+            junction_centroid = {
+                'lon': centroid_ll.x, 'lat': centroid_ll.y,
+                'x_utm': centroid_utm.x, 'y_utm': centroid_utm.y,
+            }
+
+            # controlled_crossed_by: limit crossed_by to same-controller approaches
+            controlled_crossed_by = {}
+            for a_sid in approach_segments:
+                if a_sid in adjacency:
+                    crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_segments]
+                    if crosses:
+                        controlled_crossed_by[a_sid] = crosses
+
+            controllers[controller_id] = {
+                'controller_id': controller_id,
+                'junction_id': None,
+                'approach_segments': approach_segments,
+                'junction_segments': [],
+                'controlled_crossed_by': controlled_crossed_by,
+                'raw_osm_signals': raw_osm_signals,
+                'signal_count': len(raw_osm_signals),
+                'junction_centroid': junction_centroid,
+                'source': 'standalone_signal',
+            }
+
+    for sig_idx, sd in ungrouped_signals:
+        osm_node_id = sd['osm_node_id']
+        controller_id = f"s_{osm_node_id}"
+
+        host_seg = sd.get('hosted_on_segment')
+        approach_set = {host_seg} if host_seg else set()
+        if host_seg and host_seg in adjacency:
+            adj_ego = adjacency[host_seg]
+            # Discard merge segments
+            for s in adj_ego.get('merges_with', []):
+                approach_set.discard(s)
+            for s in adj_ego.get('merged_by', []):
+                approach_set.discard(s)
+            approach_segments = list(approach_set)
+        raw_osm_signals = [{
+            'osm_node_id': sd['osm_node_id'],
+            'lon': sd['lon'], 'lat': sd['lat'],
+            'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
+            'hosted_on_segment': host_seg,
+            'position_along_host_m': sd.get('position_along_host_m'),
+        }]
+
+        sig_pt_ll = gpd.GeoDataFrame(
+            geometry=[sd['geometry']], crs=edges.crs
+        ).to_crs("EPSG:4326").geometry.iloc[0]
+
+        junction_centroid = {
+            'lon': sig_pt_ll.x, 'lat': sig_pt_ll.y,
+            'x_utm': sd['x_utm'], 'y_utm': sd['y_utm'],
+        }
+
+        # controlled_crossed_by: limit crossed_by to same-controller approaches
+        controlled_crossed_by = {}
+        for a_sid in approach_segments:
+            if a_sid in adjacency:
+                crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in approach_segments]
+                if crosses:
+                    controlled_crossed_by[a_sid] = crosses
+
+        controllers[controller_id] = {
+            'controller_id': controller_id,
+            'junction_id': None,
+            'approach_segments': approach_segments,
+            'junction_segments': [],
+            'controlled_crossed_by': controlled_crossed_by,
+            'raw_osm_signals': raw_osm_signals,
+            'signal_count': 1,
+            'junction_centroid': junction_centroid,
+            'source': 'standalone_signal',
+        }
+
+    # ------------------------------------------------------------------
+    # Step 5b Filter link roads from approach segments
+    # ------------------------------------------------------------------
+    for ctrl_id, ctrl in controllers.items():
+        occupied_segments = {s.get('hosted_on_segment') for s in ctrl['raw_osm_signals']}
+        valid_approaches = []
+        for sid in ctrl['approach_segments']:
+            row = seg_lookup.get(sid)
+            if row is not None and str(row.get('highway', '')).endswith('_link'):
+                if sid in occupied_segments:
+                    valid_approaches.append(sid)
+            else:
+                valid_approaches.append(sid)
+        
+        ctrl['approach_segments'] = valid_approaches
+        
+        controlled_crossed_by = {}
+        for a_sid in valid_approaches:
+            if a_sid in adjacency:
+                crosses = [x for x in adjacency[a_sid].get('crossed_by', []) if x in valid_approaches]
+                if crosses:
+                    controlled_crossed_by[a_sid] = crosses
+        ctrl['controlled_crossed_by'] = controlled_crossed_by
+
+    # ------------------------------------------------------------------
+    # Step 6  Write back to edges
+    # ------------------------------------------------------------------
+    seg_to_controller = {}
+    seg_to_role = {}
+    for ctrl_id, ctrl in controllers.items():
+        for sid in ctrl['approach_segments']:
+            seg_to_controller[sid] = ctrl_id
+            seg_to_role[sid] = 'approach'
+        for sid in ctrl['junction_segments']:
+            # Approach role takes precedence if a segment appears in both
+            if sid not in seg_to_controller:
+                seg_to_controller[sid] = ctrl_id
+                seg_to_role[sid] = 'junction_internal'
+
+    ctrl_ids = []
+    ctrl_roles = []
+    sig_at_end = []
+    for _, row in edges.iterrows():
+        sid = str(row['segment_id'])
+        cid = seg_to_controller.get(sid, "")
+        role = seg_to_role.get(sid, "")
+        ctrl_ids.append(cid)
+        ctrl_roles.append(role)
+        # Redefined: True iff the segment has a controller and is an approach
+        sig_at_end.append(bool(cid and role == 'approach'))
+
+    edges['controller_id'] = ctrl_ids
+    edges['controller_role'] = ctrl_roles
+    edges['signal_at_end'] = sig_at_end
+
+    n_junc = sum(1 for c in controllers.values() if c['source'] == 'junction_polygon')
+    n_solo = sum(1 for c in controllers.values() if c['source'] == 'standalone_signal')
+    n_approach = sum(len(c['approach_segments']) for c in controllers.values())
+    n_internal = sum(len(c['junction_segments']) for c in controllers.values())
+    logger.info(
+        f"Built {len(controllers)} signal controllers "
+        f"({n_junc} junction-based, {n_solo} standalone)."
+    )
+    logger.info(f"  Approach segments: {n_approach}, Junction-internal segments: {n_internal}")
+
+    return controllers, edges
+
+
+def split_multi_signal_segments(edges, adjacency, config):
+    """
+    Splits one-way segments at the first traffic signal when:
+      - the segment has multiple signals (split 3.5m past the first), or
+      - the segment has a single signal within 10m of its start (split 3.5m
+        past that signal so the short piece becomes a junction link via
+        classify_junctions), provided the remaining piece is not also very
+        short (e.g., < classify_max_length_m), or
+      - the segment is > 50m long and has a single signal in the middle
+        (not at the front and not near the end).
+    """
+    logger.info("Splitting segments with traffic signals near the start or mid-segment...")
+    offset = config.get("signal_split_offset", 3.5)
+
+    new_edges_list = []
+    to_remove = []
+
+    # Track the max existing node ID to create a new intermediate node
+    max_node_id = max(edges['u'].max(), edges['v'].max())
+    next_node_id = max_node_id + 1
+
+    edges_to_process = edges.copy()
+
+    for idx, row in edges_to_process.iterrows():
+        is_oneway = str(row.get('oneway', 'False')).lower() in ['true', 'yes', '1']
+        if not is_oneway:
+            continue
+
+        sig_pos_raw = row.get('signal_positions', "[]")
+        try:
+            sig_positions = json.loads(sig_pos_raw)
+        except:
+            sig_positions = []
+
+        if not sig_positions:
+            continue
+
+        d1 = sig_positions[0]
+        d_split = None
+
+        if len(sig_positions) >= 2:
+            d_split = d1 + offset
+            # Safety check: ensure split is within geometry and before the second signal
+            if d_split >= row['length'] - 2.0 or d_split >= sig_positions[1]:
+                d_split = None
+        elif len(sig_positions) == 1 and d1 <= 10.0:
+            d_split = d1 + offset
+            # Skip if the remaining segment would be too short (< classify_max_length_m)
+            if d_split >= row['length'] - config.get("classify_max_length_m", 15.0):
+                d_split = None
+        elif len(sig_positions) == 1 and row['length'] > 50.0 and d1 > 10.0:
+            d_split = d1 + offset
+            # Skip if the remaining segment would be too short (meaning signal is near the end)
+            if d_split >= row['length'] - config.get("classify_max_length_m", 15.0):
+                d_split = None
+
+        if d_split is None:
+            continue
+
+        sid = str(row['segment_id'])
+        logger.info(f"Splitting segment {sid} at {d_split:.1f}m (first signal at {d1:.1f}m)")
+
+        line_a, line_b = cut_line_at_distance(row.geometry, d_split)
+        if not line_a or not line_b:
+            continue
+
+        mid_node = next_node_id
+        next_node_id += 1
+
+        sid_a = sid + "_a"
+        sid_b = sid + "_b"
+
+        # Create segment A (up to split point)
+        row_a = row.copy()
+        row_a['segment_id'] = sid_a
+        row_a['geometry'] = line_a
+        row_a['length'] = line_a.length
+        row_a['v'] = mid_node
+        row_a['signal_positions'] = json.dumps([d1])
+        row_a['signal_at_end'] = True
+
+        # Create segment B (from split point)
+        row_b = row.copy()
+        row_b['segment_id'] = sid_b
+        row_b['geometry'] = line_b
+        row_b['length'] = line_b.length
+        row_b['u'] = mid_node
+        remaining_sigs = [p - d_split for p in sig_positions[1:]]
+        row_b['signal_positions'] = json.dumps(remaining_sigs)
+        row_b['signal_at_end'] = bool(remaining_sigs) and any(
+            p >= line_b.length - 1.0 for p in remaining_sigs
+        )
+
+        new_edges_list.append(row_a)
+        new_edges_list.append(row_b)
+        to_remove.append(idx)
+
+        # --- Rewire Adjacency ---
+        if sid in adjacency:
+            adj_ego = adjacency[sid]
+
+            # A connects to B
+            adjacency[sid_a] = adj_ego.copy()
+            adjacency[sid_a]['to'] = [sid_b]
+            adjacency[sid_a]['to_lengths'] = [row_b['length']]
+            adjacency[sid_a]['turns_into'] = []
+            adjacency[sid_a]['turns_into_lengths'] = []
+            adjacency[sid_a]['merges_into'] = []
+            adjacency[sid_a]['merges_into_lengths'] = []
+            adjacency[sid_a]['u_turns_into'] = []
+            adjacency[sid_a]['u_turns_into_lengths'] = []
+
+            # B inherits outgoing connections from original sid
+            adjacency[sid_b] = adj_ego.copy()
+            adjacency[sid_b]['from'] = [sid_a]
+            adjacency[sid_b]['from_lengths'] = [row_a['length']]
+
+            # Update all other segments that pointed TO sid or came FROM sid
+            for other_id, other_adj in adjacency.items():
+                if other_id in [sid, sid_a, sid_b]: continue
+
+                # Replace sid with sid_a for incoming connections
+                for rel in ['to', 'turns_into', 'merges_into', 'u_turns_into']:
+                    if sid in other_adj.get(rel, []):
+                        idx_rel = other_adj[rel].index(sid)
+                        other_adj[rel][idx_rel] = sid_a
+
+                # Replace sid with sid_b for outgoing connections
+                if sid in other_adj.get('from', []):
+                    idx_from = other_adj['from'].index(sid)
+                    other_adj['from'][idx_from] = sid_b
+
+                # Replace sid in crosses / crossed_by
+                if sid in other_adj.get('crosses', []):
+                    idx_c = other_adj['crosses'].index(sid)
+                    other_adj['crosses'][idx_c] = sid_a
+                if sid in other_adj.get('crossed_by', []):
+                    idx_cb = other_adj['crossed_by'].index(sid)
+                    other_adj['crossed_by'][idx_cb] = sid_a
+
+            del adjacency[sid]
+
+    if to_remove:
+        edges = edges.drop(to_remove)
+        new_edges_gdf = gpd.GeoDataFrame(new_edges_list, crs=edges.crs)
+        edges = pd.concat([edges, new_edges_gdf], ignore_index=True)
+        logger.info(f"Split {len(to_remove)} segments into {len(new_edges_list)} pieces.")
+
+    return edges, adjacency
+
 
 def get_smoothed_heading(geom, reverse=False, look_dist=10.0):
     """
@@ -313,19 +1417,19 @@ def _dedupe_crosses_against_merges(adjacency):
     of segments we keep only the merge relationship.
     """
     for data in adjacency.values():
-        merges_with = set(data.get('merges_with', []))
-        merged_by = set(data.get('merged_by', []))
-        for rel, len_key, drop in (
-            ('crosses', 'crosses_lengths', merges_with),
-            ('crossed_by', 'crossed_by_lengths', merged_by),
+        all_merges = set(data.get('merges_with', [])) | set(data.get('merged_by', []))
+        if not all_merges:
+            continue
+            
+        for rel, len_key in (
+            ('crosses', 'crosses_lengths'),
+            ('crossed_by', 'crossed_by_lengths'),
         ):
-            if not drop:
-                continue
             ids = data.get(rel, [])
             lens = data.get(len_key, [])
             kept_ids, kept_lens = [], []
             for sid, ln in zip(ids, lens):
-                if sid in drop:
+                if sid in all_merges:
                     continue
                 kept_ids.append(sid)
                 kept_lens.append(ln)
@@ -765,7 +1869,9 @@ def build_topological_adjacency(edges_gdf, config):
     for ego_id, data in adjacency.items():
         for A in data.get('merges_into', []):
             if A in adjacency:
-                for P in adjacency[A].get('from', []):
+                from_segs = adjacency[A].get('from', [])
+                if from_segs:
+                    P = from_segs[0]
                     if P not in adjacency[ego_id]['merges_with']:
                         adjacency[ego_id]['merges_with'].append(P)
                         adjacency[ego_id]['merges_with_lengths'].append(segment_data[P]['length'])
@@ -779,6 +1885,85 @@ def build_topological_adjacency(edges_gdf, config):
     _dedupe_crosses_against_merges(adjacency)
 
     return adjacency, restrictions
+
+def has_crossing_edges_at_connection(geom_J, geom_target, is_succ, gdf, s_id, target_id, deleted, tree, tree_geoms, tree_ids):
+    """
+    Returns True if any other edge's geometry crosses the short corridor formed
+    by the junction link (geom_J) and target segment (geom_target) at their
+    connection point. Used to block geometrically unsafe merges.
+
+    Parameters
+    ----------
+    geom_J      : shapely geometry of the junction link
+    geom_target : shapely geometry of the target segment
+    is_succ     : True if target is a successor (J -> target), False if predecessor
+    gdf         : full GeoDataFrame indexed by segment_id
+    s_id        : segment_id of the junction link
+    target_id   : segment_id of the target segment
+    deleted     : set of already-deleted segment ids
+    tree        : STRtree built from all gdf geometries (built once outside the loop)
+    tree_geoms  : list of geometries parallel to the STRtree
+    tree_ids    : list of segment_ids parallel to the STRtree
+    """
+    BUFFER_RADIUS = 3.0   # metres around connection point for candidate search
+    CORRIDOR_HALF_WIDTH = 1.0  # metres buffer around the short corridor LineString
+
+    # --- connection point and short corridor ---
+    coords_J = list(geom_J.coords)
+    coords_T = list(geom_target.coords)
+
+    if is_succ:
+        # Junction link flows INTO target: last point of J == first point of T
+        conn_pt = Point(coords_J[-1])
+        # Take the last 2 coords of J and first 2 coords of T as the corridor
+        corridor_coords = coords_J[-2:] + coords_T[:2]
+    else:
+        # Target flows INTO junction link: last point of T == first point of J
+        conn_pt = Point(coords_J[0])
+        # Take last 2 coords of T and first 2 coords of J as the corridor
+        corridor_coords = coords_T[-2:] + coords_J[:2]
+
+    # Deduplicate consecutive duplicate coordinates (can happen at shared nodes)
+    deduped = [corridor_coords[0]]
+    for c in corridor_coords[1:]:
+        if c != deduped[-1]:
+            deduped.append(c)
+
+    if len(deduped) < 2:
+        return False
+
+    corridor_line = LineString(deduped)
+    corridor_buf = corridor_line.buffer(CORRIDOR_HALF_WIDTH)
+
+    # --- spatial query ---
+    # Edges that share an endpoint at the connection node (e.g. opposite-
+    # direction pair of a two-way road) are topologically connected, not
+    # crossing through.  Collect the node id so we can skip them.
+    if is_succ:
+        conn_node = gdf.at[s_id, 'v']
+    else:
+        conn_node = gdf.at[s_id, 'u']
+
+    search_buf = conn_pt.buffer(BUFFER_RADIUS)
+    candidate_indices = tree.query(search_buf)
+
+    for idx in candidate_indices:
+        cand_id = tree_ids[idx]
+        if cand_id == s_id or cand_id == target_id:
+            continue
+        if cand_id in deleted:
+            continue
+        # Skip edges that share the connection node — they connect to it,
+        # not pass through it (typical for opposite-direction pairs).
+        if cand_id in gdf.index:
+            if gdf.at[cand_id, 'u'] == conn_node or gdf.at[cand_id, 'v'] == conn_node:
+                continue
+        cand_geom = tree_geoms[idx]
+        if cand_geom.crosses(corridor_buf):
+            return True
+
+    return False
+
 
 def merge_short_segments(gdf, adj, config):
     """
@@ -798,10 +1983,21 @@ def merge_short_segments(gdf, adj, config):
     gdf = gdf.copy()
     gdf.set_index('segment_id', inplace=True, drop=False)
 
+    # Track segments produced by a junction-pair merge that exceeded max_len and
+    # were unflagged as junction links. build_controllers uses this to avoid
+    # reassigning them back to junction status.
+    gdf['was_merged'] = 'False'
+
     junction_sids = set(gdf[gdf['is_internal_junction'].astype(str).str.lower() == 'true'].index.astype(str))
     deleted = set()
     standalone_count = 0
     shape_count = 0
+
+    # Build STRtree once for geometrical crossing checks (tree is static;
+    # deleted edges are filtered out at query time).
+    _tree_ids = list(gdf.index.astype(str))
+    _tree_geoms = list(gdf['geometry'])
+    _strtree = STRtree(_tree_geoms)
 
     max_len = config["classify_max_length_m"]
     look_dist = config["heading_look_dist"]
@@ -865,6 +2061,10 @@ def merge_short_segments(gdf, adj, config):
 
         s_adj = adj.get(str(s_id))
         if not s_adj: continue
+
+        if s_adj.get('merged_by'):
+            junctions_logger.info(f"Skipping merge for {s_id}: it is 'merged_by' another segment.")
+            continue
 
         if shape_mode:
             # A shape-junction edge with branching turns or incoming crossings
@@ -950,6 +2150,25 @@ def merge_short_segments(gdf, adj, config):
             target_id = P; is_succ = False
 
         if not target_id or target_id == s_id or target_id not in gdf.index or target_id in deleted:
+            continue
+
+        # Geometrical crossing check: block the merge if another edge cuts
+        # through the corridor where the junction link meets the target segment.
+        if has_crossing_edges_at_connection(
+            gdf.loc[s_id, 'geometry'], gdf.loc[target_id, 'geometry'],
+            is_succ, gdf, s_id, target_id, deleted,
+            _strtree, _tree_geoms, _tree_ids
+        ):
+            if shape_mode:
+                junctions_logger.info(
+                    f"Skipping shape-junction merge for {s_id} -> {target_id}: "
+                    f"crossing edge detected at connection point."
+                )
+            else:
+                logger.info(
+                    f"Skipping standalone junction merge for {s_id} -> {target_id}: "
+                    f"crossing edge detected at connection point."
+                )
             continue
 
         s_row, t_row = gdf.loc[s_id], gdf.loc[target_id]
@@ -1066,6 +2285,7 @@ def merge_junction_pairs(gdf, adj, config):
             gdf.at[b_id, 'is_internal_junction'] = 'False'
             if 'is_shape_junction' in gdf.columns:
                 gdf.at[b_id, 'is_shape_junction'] = 'False'
+            gdf.at[b_id, 'was_merged'] = 'True'
             junctions_logger.info(
                 f"Merged junction pair {a_id}+{b_id} -> {b_id} "
                 f"(length {merged_len:.2f}m > {max_len}m; unflagged as junction)."
@@ -1091,6 +2311,51 @@ def merge_junction_pairs(gdf, adj, config):
     logger.info(f"Merged {total} junction link pair(s).")
     gdf.reset_index(drop=True, inplace=True)
     return gdf
+
+def unflag_long_link_junctions(edges_gdf, config):
+    """
+    Unflags long *_link segments as junction links if they host a single traffic signal.
+    This prevents them from being bypassed during junction propagation, allowing vehicles
+    to queue on them appropriately.
+    """
+    max_length_m = config.get("classify_max_length_m", 15.0)
+    unflagged_count = 0
+    
+    for idx, row in edges_gdf.iterrows():
+        # Must be classified as an internal junction
+        if str(row.get('is_internal_junction', 'False')).lower() != 'true':
+            continue
+            
+        # Must be a _link road
+        highway = str(row.get('highway', ''))
+        if not highway.endswith('_link'):
+            continue
+            
+        # Must be longer than the threshold
+        if float(row.get('length', 0.0)) <= max_length_m:
+            continue
+            
+        # Must have exactly one signal
+        sig_pos_raw = row.get('signal_positions', "[]")
+        try:
+            sig_positions = json.loads(sig_pos_raw)
+        except:
+            sig_positions = []
+            
+        if len(sig_positions) == 1:
+            edges_gdf.at[idx, 'is_internal_junction'] = 'False'
+            edges_gdf.at[idx, 'is_shape_junction'] = 'False'
+            edges_gdf.at[idx, 'is_long_shape_boundary'] = 'False'
+            unflagged_count += 1
+            junctions_logger.info(
+                f"Unflagged long _link segment {row['segment_id']} (length {row['length']:.1f}m) "
+                f"as a junction link because it hosts a single traffic signal."
+            )
+            
+    if unflagged_count > 0:
+        junctions_logger.info(f"Unflagged {unflagged_count} long signalized _link segments in total.")
+        
+    return edges_gdf
 
 def classify_junctions(edges_gdf, config):
     from shapely.ops import polygonize
@@ -1124,6 +2389,7 @@ def classify_junctions(edges_gdf, config):
     
     # Condition 2: Edges forming small shapes
     shape_edges = set()
+    long_boundary_edges = set()   # on the boundary but length > classify_shape_max_length_m
     if junction_polys:
         sindex = edges_gdf.sindex
         for poly in junction_polys:
@@ -1138,6 +2404,11 @@ def classify_junctions(edges_gdf, config):
                 if geom.intersection(bound).length > config["classify_min_intersection_length"]:
                     if row['length'] <= config["classify_shape_max_length_m"]:
                         poly_edge_indices.append(idx)
+                    else:
+                        # Edge is on the polygon boundary but too long to be classified
+                        # as a junction link here. Track it so build_controllers can
+                        # reassign it if the polygon becomes part of a junction group.
+                        long_boundary_edges.add(idx)
             shape_edges.update(poly_edge_indices)
             junction_edges_idx.update(poly_edge_indices)
 
@@ -1165,13 +2436,21 @@ def classify_junctions(edges_gdf, config):
 
     edges_gdf['is_internal_junction'] = 'False'
     edges_gdf.loc[list(junction_edges_idx), 'is_internal_junction'] = 'True'
-    
+
     edges_gdf['is_shape_junction'] = 'False'
     edges_gdf.loc[list(shape_edges), 'is_shape_junction'] = 'True'
-    
+
+    # Edges that lie on a junction polygon boundary but whose length exceeds
+    # classify_shape_max_length_m are tracked here so build_controllers can
+    # reassign them as junction links when the polygon forms a junction group.
+    edges_gdf['is_long_shape_boundary'] = 'False'
+    # Exclude any that were also classified as junction links through other conditions
+    long_boundary_only = long_boundary_edges - junction_edges_idx
+    edges_gdf.loc[list(long_boundary_only), 'is_long_shape_boundary'] = 'True'
+
     edges_gdf['is_semantic_junction'] = 'False'
     edges_gdf.loc[list(semantic_edges), 'is_semantic_junction'] = 'True'
-    
+
     edges_gdf['is_manual_junction'] = 'False'
     edges_gdf.loc[list(manual_edges), 'is_manual_junction'] = 'True'
 
@@ -1412,8 +2691,8 @@ def propagate_junction_topology(adjacency, edges_gdf, restrictions, config):
                         continue
 
                     direction = classify_direction(ego_id, tgt)
-                    all_through = (entry_rel == 'to'
-                                   and all(r == 'to' for r in chain_rels))
+                    all_through_after_entry = all(r == 'to' for r in chain_rels)
+                    all_through = (entry_rel == 'to' and all_through_after_entry)
                     saw_merge = (entry_rel == 'merges_into'
                                  or 'merges_into' in chain_rels)
 
@@ -1437,9 +2716,9 @@ def propagate_junction_topology(adjacency, edges_gdf, restrictions, config):
                         new_rel = 'u_turns_into'
                     elif forced_turn:
                         new_rel = 'turns_into'
-                    elif direction == 'straight' and all_through and not saw_merge:
+                    elif direction == 'straight' and all_through:
                         new_rel = 'to'
-                    elif direction == 'straight' and saw_merge:
+                    elif (entry_rel == 'merges_into' and all_through_after_entry) or (direction == 'straight' and saw_merge):
                         new_rel = 'merges_into'
                     else:
                         new_rel = 'turns_into'
@@ -1517,6 +2796,34 @@ def propagate_junction_topology(adjacency, edges_gdf, restrictions, config):
                 continue
             adjacency[ego_id][new_rel].append(tgt)
             adjacency[ego_id][LEN_KEY[new_rel]].append(segment_data[tgt]['length'])
+
+    # ---- Remove redundant bypass connections when a slip _link exists ----
+    for ego_id in [sid for sid in adjacency.keys() if sid not in junction_set]:
+        ego_outs = adjacency[ego_id].get('to', []) + adjacency[ego_id].get('turns_into', []) + adjacency[ego_id].get('merges_into', [])
+        link_outs = [sid for sid in ego_outs if sid in segment_data and segment_data[sid]['highway'].endswith('_link')]
+        
+        targets_to_remove = set()
+        for L in link_outs:
+            L_targets = adjacency.get(L, {}).get('to', []) + adjacency.get(L, {}).get('turns_into', []) + adjacency.get(L, {}).get('merges_into', []) + adjacency.get(L, {}).get('u_turns_into', [])
+            for S in L_targets:
+                targets_to_remove.add(S)
+                
+        if targets_to_remove:
+            for S in targets_to_remove:
+                for relkey in ['to', 'turns_into', 'merges_into', 'u_turns_into']:
+                    if S in adjacency[ego_id].get(relkey, []):
+                        idx = adjacency[ego_id][relkey].index(S)
+                        adjacency[ego_id][relkey].pop(idx)
+                        len_key = relkey + '_lengths' if not relkey.endswith('s') else relkey[:-1] + '_lengths'
+                        if len_key in adjacency[ego_id]:
+                            adjacency[ego_id][len_key].pop(idx)
+                        junctions_logger.info(f"Post-propagation cleanup: Removed redundant connection {ego_id} -> {S} because {ego_id} -> _link -> {S} exists.")
+                        
+                        if relkey == 'to' and S in adjacency and ego_id in adjacency[S].get('from', []):
+                            f_idx = adjacency[S]['from'].index(ego_id)
+                            adjacency[S]['from'].pop(f_idx)
+                            if 'from_lengths' in adjacency[S]:
+                                adjacency[S]['from_lengths'].pop(f_idx)
 
     # ---- Recompute crosses / crossed_by using the expanded junction footprint ----
     junctions_logger.info("Recomputing crosses/crossed_by after junction propagation...")
@@ -1618,7 +2925,9 @@ def propagate_junction_topology(adjacency, edges_gdf, restrictions, config):
     for ego_id in nonjunc_ids:
         for A in adjacency[ego_id].get('merges_into', []):
             if A in adjacency and A in nonjunc_ids:
-                for P in adjacency[A].get('from', []):
+                from_segs = adjacency[A].get('from', [])
+                if from_segs:
+                    P = from_segs[0]
                     if P in nonjunc_ids:
                         if P not in adjacency[ego_id]['merges_with']:
                             adjacency[ego_id]['merges_with'].append(P)
@@ -1646,6 +2955,11 @@ def simplify_network_topology(gdf, adj):
     logger.info("Simplifying final network topology (merging 1-to-1 non-junction chains)...")
     gdf = gdf.copy()
     gdf.set_index('segment_id', inplace=True, drop=False)
+
+    # Ensure the merge-tracking column exists. Segments that absorb a neighbour
+    # are flagged so build_controllers won't reassign them as junction links.
+    if 'was_merged' not in gdf.columns:
+        gdf['was_merged'] = 'False'
     
     edges_by_u = gdf.groupby('u').apply(lambda x: [str(i) for i in x.index]).to_dict()
     edges_by_v = gdf.groupby('v').apply(lambda x: [str(i) for i in x.index]).to_dict()
@@ -1669,7 +2983,13 @@ def simplify_network_topology(gdf, adj):
             a_v = gdf.at[a_id, 'v']
             b_u = gdf.at[b_id, 'u']
             if a_v != b_u: continue
-            
+
+            # Only merge segments with matching lane counts
+            a_lanes = gdf.at[a_id, 'lanes'] if 'lanes' in gdf.columns else np.nan
+            b_lanes = gdf.at[b_id, 'lanes'] if 'lanes' in gdf.columns else np.nan
+            if pd.notna(a_lanes) and pd.notna(b_lanes) and float(a_lanes) != float(b_lanes):
+                continue
+
             a_opp = [str(x) for x in adj[a_id].get('opposite_direction', [])]
             b_opp = [str(x) for x in adj[b_id].get('opposite_direction', [])]
             
@@ -1774,7 +3094,8 @@ def simplify_network_topology(gdf, adj):
                             
         del adj[absorber]
         gdf = gdf.drop(index=absorber)
-        
+        gdf.at[keeper, 'was_merged'] = 'True'
+
         # Update adjacency references seamlessly avoiding a costly rebuild
         for sid, data in adj.items():
             for key, val_list in data.items():
@@ -1815,7 +3136,7 @@ def main():
     parser = argparse.ArgumentParser(description="Build robust topological adjacency. Always downloads the latest network.")
     parser.add_argument('--output', default='topological_adjacency.json', help="Output JSON filename.")
     parser.add_argument('--bbox', type=float, nargs=4, default=[23.71317, 37.97161, 23.74515, 37.99880], help="Bounding box coordinates in the order: west south east north (left bottom right top)")
-    parser.add_argument('--merge-short', action='store_true', help="Enable merging of segments shorter than 15m to fill gaps")
+    parser.add_argument('--merge-short', action='store_true', help="Enable merging of segments shorter than classify_max_length_m to fill gaps")
     parser.add_argument('--merge-junctions', action='store_true', help="After all other steps, merge chained junction link pairs connected only by to/from, then re-run junction propagation")
     parser.add_argument('--simplify-network', action='store_true', help="Merge consecutive non-junction segments with simple 1-to-1 topological connections")
     args = parser.parse_args()
@@ -1845,17 +3166,20 @@ def main():
             'primary', 'secondary', 'trunk', 'motorway', 
             'primary_link', 'secondary_link', 'trunk_link', 'motorway_link'
         ],
-        "classify_max_area_sqm": 600.0,
+        "classify_max_area_sqm": 500.0,
         "classify_max_length_m": 18.0,
         "classify_shape_max_length_m": 35.0,
         "classify_min_intersection_length": 1e-5,
         "segments_junctions_path": "segments_junctions.json",
         "junction_max_depth": 10,
-        "network_path": "osm_network.gpkg"
+        "network_path": "osm_network.gpkg",
+        "signal_endpoint_tolerance": 1.0,
+        "controller_junction_tolerance": 5.0
     }
     
     # Always download the network as requested
-    edges = get_osm_network(tuple(args.bbox), config)
+    edges, signal_data = get_osm_network(tuple(args.bbox), config)
+    signal_points = [s['geometry'] for s in signal_data]
     
     # 1. Build initial adjacency to know who connects to who
     adjacency, restrictions = build_topological_adjacency(edges, config)
@@ -1882,17 +3206,43 @@ def main():
     if args.simplify_network:
         # 5. Simplify non-junction 1-to-1 chains
         edges, adjacency = simplify_network_topology(edges, adjacency)
-        
-        
+
+    # 6. Tag approach segments that terminate at a traffic-signal node. Done after all
+    #    merges so the endpoint geometry reflects the final, persisted edge layout.
+    edges, signal_data = tag_signals_at_end(edges, signal_data, adjacency, tolerance=config["signal_endpoint_tolerance"])
+
+    # 6b. Split segments with multiple traffic signals
+    edges, adjacency = split_multi_signal_segments(edges, adjacency, config)
+    edges = classify_junctions(edges, config)
+
+    # 6c. Unflag long _link segments with a single signal so they are not bypassed
+    edges = unflag_long_link_junctions(edges, config)
+
+    # 6d. Rebuild adjacency so predecessor/successor relationships reflect the final junction flags
+    adjacency, restrictions = build_topological_adjacency(edges, config)
+
+    adjacency = propagate_junction_topology(adjacency, edges, restrictions, config)
+
+    # 7. Build logical signal controllers from signalized junctions.
+    controllers, edges = build_controllers(edges, signal_data, adjacency, config)
+    adjacency = propagate_junction_topology(adjacency, edges, restrictions, config)
+    
+
+
+    controllers_path = os.path.join(os.path.dirname(args.output) or '.', 'controllers.json')
+    with open(controllers_path, 'w') as f:
+        json.dump(controllers, f, indent=4)
+    logger.info(f"Saved {len(controllers)} controllers to {controllers_path}")
+
     network_path = config["network_path"]
     logger.info(f"Saving final merged OSM network to {network_path}...")
-    
+
     # GPKG cannot handle lists well. Convert any list-like osmid or highway tags to simple strings for saving.
     edges_to_save = edges.copy()
     for col in edges_to_save.columns:
         if edges_to_save[col].apply(lambda x: isinstance(x, list)).any():
             edges_to_save[col] = edges_to_save[col].astype(str)
-            
+
     edges_to_save.to_file(network_path, driver="GPKG")
 
     logger.info(f"Exporting adjacency to {args.output}...")

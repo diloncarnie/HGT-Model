@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -62,11 +63,60 @@ def visualize_adjacency(network_file, adjacency_file):
     else:
         polygons_4326 = []
         
+    # Interpolate signal markers in the source (UTM) CRS so the along-geometry
+    # offset is accurate, then project the resulting points to EPSG:4326.
+    signal_marker_records = []
+    if 'signal_positions' in edges.columns:
+        from shapely.geometry import Point as _ShPoint
+        utm_crs = edges.crs
+        for _, row in edges.iterrows():
+            raw = row.get('signal_positions')
+            if not raw or raw in ("[]", "None"):
+                continue
+            try:
+                positions = json.loads(raw) if isinstance(raw, str) else list(raw)
+            except (ValueError, TypeError):
+                continue
+            geom = row.geometry
+            if geom is None or geom.is_empty or not positions:
+                continue
+            for p in positions:
+                pt = geom.interpolate(float(p))
+                signal_marker_records.append({
+                    'segment_id': str(row['segment_id']),
+                    'position_m': float(p),
+                    'geometry': _ShPoint(pt.x, pt.y)
+                })
+    if signal_marker_records:
+        sig_markers_gdf = gpd.GeoDataFrame(signal_marker_records, crs=utm_crs).to_crs("EPSG:4326")
+    else:
+        sig_markers_gdf = gpd.GeoDataFrame(columns=['segment_id', 'position_m', 'geometry'], crs="EPSG:4326")
+
     if edges.crs != "EPSG:4326":
         edges = edges.to_crs("EPSG:4326")
-        
+
     with open(adjacency_file, 'r') as f:
         adjacency = json.load(f)
+
+    # Load controllers for controller-aware visualization
+    controllers_path = os.path.join(os.path.dirname(adjacency_file) or '.', 'controllers.json')
+    controllers = {}
+    if os.path.exists(controllers_path):
+        with open(controllers_path, 'r') as f:
+            controllers = json.load(f)
+        print(f"Loaded {len(controllers)} signal controllers from {controllers_path}.")
+
+    # Use controllers.json as the source of truth for signal markers to ensure
+    # we respect the fixed directional/oneway assignment logic.
+    signal_lats, signal_lons, signal_hover = [], [], []
+    for ctrl_id, ctrl in controllers.items():
+        for sig in ctrl.get('raw_osm_signals', []):
+            signal_lats.append(sig['lat'])
+            signal_lons.append(sig['lon'])
+            signal_hover.append(
+                f"Traffic signal on segment {sig.get('hosted_on_segment', '?')} "
+                f"(Controller: {ctrl_id})"
+            )
 
     edges['segment_id_str'] = edges['segment_id'].astype(str)
     
@@ -97,7 +147,7 @@ def visualize_adjacency(network_file, adjacency_file):
     edges['merged_by_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'merged_by'))
     
     # Ensure relevant columns exist before adding them to hover data
-    for col in ['turn:lanes', 'turn', 'junction', 'is_internal_junction', 'is_shape_junction', 'is_semantic_junction']:
+    for col in ['turn:lanes', 'turn', 'junction', 'is_internal_junction', 'is_shape_junction', 'is_semantic_junction', 'signal_at_end', 'controller_id', 'controller_role']:
         if col not in edges.columns:
             edges[col] = "None"
         else:
@@ -180,22 +230,12 @@ def visualize_adjacency(network_file, adjacency_file):
             "oneway": True,
             "lanes": True,
             "turn:lanes": True,
-            "junction": True,
             "is_internal_junction": True,
             "is_shape_junction": True,
             "is_semantic_junction": True,
-            "to_info": True,
-            "from_info": True,
-            "crossed_by_info": True,
-            "turns_into_info": True,
-            "merges_into_info": True,
-            "u_turns_into_info": True,
-            "crosses_info": True,
-            "opposite_direction_info": True,
-            "banned_successors_info": True,
-            "only_successors_info": True,
-            "merges_with_info": True,
-            "merged_by_info": True,
+            "signal_at_end": True,
+            "controller_id": True,
+            "controller_role": True,
             "lat": False,
             "lon": False
         },
@@ -212,23 +252,22 @@ def visualize_adjacency(network_file, adjacency_file):
         sid = row['segment_id_str']
         coords = geo_map.get(sid, [])
         is_junc = str(row.get('is_internal_junction', 'False')).lower() == 'true'
-        
-        for pt in coords:
-            if pt[0] is not None:
-                if is_junc:
+
+        if is_junc:
+            for pt in coords:
+                if pt[0] is not None:
                     junc_lats.append(pt[0])
                     junc_lons.append(pt[1])
-                else:
-                    bg_lats.append(pt[0])
-                    bg_lons.append(pt[1])
-        
-        if is_junc:
             junc_lats.append(None)
             junc_lons.append(None)
         else:
+            for pt in coords:
+                if pt[0] is not None:
+                    bg_lats.append(pt[0])
+                    bg_lons.append(pt[1])
             bg_lats.append(None)
             bg_lons.append(None)
-            
+
     # Prepare filled junction shapes traces using GeoJSON for face hover
     shape_features = []
     shape_locations = []
@@ -273,6 +312,17 @@ def visualize_adjacency(network_file, adjacency_file):
         hoverinfo='skip',
         showlegend=True
     )
+
+    signal_markers = go.Scattermap(
+        lat=signal_lats,
+        lon=signal_lons,
+        mode='markers',
+        marker=dict(size=8, color='red', symbol='circle'),
+        text=signal_hover,
+        hoverinfo='text',
+        name=f'Traffic Signals ({len(signal_lats)})',
+        showlegend=True
+    )
     
     # Use Choroplethmap to allow hovering over the polygon faces
     junc_shapes = go.Choroplethmap(
@@ -287,14 +337,55 @@ def visualize_adjacency(network_file, adjacency_file):
         hoverinfo='text',
         name='Junction Shapes'
     )
-    
+
+    # Controller centroid markers - Update to large circles
+    centroid_lats, centroid_lons, centroid_hover, centroid_ids = [], [], [], []
+    for ctrl_id, ctrl in controllers.items():
+        jc = ctrl.get('junction_centroid')
+        if jc:
+            centroid_lats.append(jc['lat'])
+            centroid_lons.append(jc['lon'])
+            centroid_ids.append(ctrl_id)
+            n_approach = len(ctrl.get('approach_segments', []))
+            n_signals = ctrl.get('signal_count', 0)
+            centroid_hover.append(
+                f"<b>Controller {ctrl_id}</b><br>"
+                f"Source: {ctrl.get('source', '?')}<br>"
+                f"Signals: {n_signals}<br>"
+                f"Approaches: {n_approach}<br>"
+                f"Segments: {', '.join(ctrl.get('approach_segments', []))}"
+            )
+
+    controller_centroids = go.Scattermap(
+        lat=centroid_lats,
+        lon=centroid_lons,
+        mode='markers',
+        marker=dict(size=18, color='gold', symbol='circle', opacity=0.7),
+        text=centroid_hover,
+        customdata=centroid_ids,
+        hoverinfo='text',
+        name=f'Controllers ({len(centroid_lats)})',
+        showlegend=True,
+    )
+
     fig.add_trace(bg_roads)
     fig.add_trace(junc_roads)
     fig.add_trace(junc_shapes)
-    
-    # Reorder: background roads at bottom, then junction shapes, then junction lines, then scatter points
+    fig.add_trace(signal_markers)
+    fig.add_trace(controller_centroids)
+
+    # Reorder: bg roads first, junction shapes, junction lines, signals, controller centroids, then the scatter points (last = on top).
+    # The scatter_map points are always data_list[0] (first trace created by px).
+    n_base = 4 + 2  # bg, junc_roads, junc_shapes, signals, centroids
     data_list = list(fig.data)
-    fig.data = (data_list[-3], data_list[-1], data_list[-2], data_list[0])
+    # data_list[0] = scatter points (from px.scatter_map)
+    # data_list[1] = bg_roads, [2] = junc_roads, [3] = junc_shapes,
+    # [4] = signals, [5] = centroids
+    ordered = [data_list[1], data_list[3], data_list[2]]  # bg, shapes, junc_roads
+    ordered.append(data_list[4])  # signals
+    ordered.append(data_list[5])  # centroids
+    ordered.append(data_list[0])  # scatter points on top
+    fig.data = tuple(ordered)
 
     print("Preparing interactive HTML...")
 
@@ -311,16 +402,23 @@ def visualize_adjacency(network_file, adjacency_file):
         var adjacency = {json.dumps(adjacency)};
         var geoMap = {json.dumps(geo_map)};
         var osmidMap = {json.dumps(osmid_map)};
+        var controllers = {json.dumps(controllers)};
         
         document.addEventListener('DOMContentLoaded', function() {{
             var plotEl = document.getElementsByClassName('plotly-graph-div')[0];
             
             plotEl.on('plotly_click', function(data){{
                 if(data.points.length > 0) {{
-                    // retrieve from customdata[0] which we set to segment_id_str
-                    var segId = data.points[0].customdata[0];
-                    console.log("Clicked Segment ID:", segId);
-                    highlightNeighbors(segId, plotEl);
+                    var point = data.points[0];
+                    if (point.data.name && point.data.name.includes('Controllers')) {{
+                        var ctrlId = point.customdata;
+                        console.log("Clicked Controller ID:", ctrlId);
+                        highlightController(ctrlId, plotEl);
+                    }} else if (point.customdata && point.customdata[0]) {{
+                        var segId = point.customdata[0];
+                        console.log("Clicked Segment ID:", segId);
+                        highlightNeighbors(segId, plotEl);
+                    }}
                 }}
             }});
 
@@ -358,6 +456,56 @@ def visualize_adjacency(network_file, adjacency_file):
                 }}
             }});
         }});
+
+        function highlightController(ctrlId, plotEl) {{
+            var ctrl = controllers[ctrlId];
+            if (!ctrl) return;
+            
+            var traces = [];
+            
+            // Highlight Approaches (Lime Green)
+            (ctrl.approach_segments || []).forEach(sid => {{
+                var sidStr = String(sid);
+                if (geoMap[sidStr]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sidStr].map(p => p[0]),
+                        lon: geoMap[sidStr].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 8, color: 'lime'}},
+                        name: 'Approach: ' + sidStr
+                    }});
+                }}
+            }});
+            
+            // Highlight Junction Internal (Orange)
+            (ctrl.junction_segments || []).forEach(sid => {{
+                var sidStr = String(sid);
+                if (geoMap[sidStr]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sidStr].map(p => p[0]),
+                        lon: geoMap[sidStr].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 8, color: 'orange'}},
+                        name: 'Internal: ' + sidStr
+                    }});
+                }}
+            }});
+
+            clearHighlights(plotEl);
+            Plotly.addTraces(plotEl, traces);
+        }}
+
+        function clearHighlights(plotEl) {{
+            var baseTraceCount = {len(ordered)};
+            var currentTracesCount = plotEl.data.length;
+            var indicesToRemove = [];
+            for (var i = baseTraceCount; i < currentTracesCount; i++) indicesToRemove.push(i);
+            if (indicesToRemove.length > 0) {{
+                Plotly.deleteTraces(plotEl, indicesToRemove);
+            }}
+        }}
 
         function highlightNeighbors(egoId, plotEl) {{
             var egoIdStr = String(egoId);
@@ -586,17 +734,7 @@ def visualize_adjacency(network_file, adjacency_file):
                 }}
             }});
 
-            // Clear previous highlight traces (indices 4 onwards)
-            var currentTracesCount = plotEl.data.length;
-            var indicesToRemove = [];
-            for (var i = 4; i < currentTracesCount; i++) indicesToRemove.push(i);
-
-            // Note: deleteTraces is synchronous but indices shift. 
-            // It's safer to remove from end or use a single call.
-            if (indicesToRemove.length > 0) {{
-                Plotly.deleteTraces(plotEl, indicesToRemove);
-            }}
-            
+            clearHighlights(plotEl);
             Plotly.addTraces(plotEl, traces);
         }}
     </script>
