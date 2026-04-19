@@ -158,11 +158,10 @@ def process_track(track_data, config):
     segment_stats = {}
     logs = []
     valid_original_indices = []
-    provisional_traversals = []  # rejected solely by stop-duration; reconsidered in pass 2
 
     n = len(track_df)
     if n == 0:
-        return traversals, segment_stats, logs, valid_original_indices, provisional_traversals
+        return traversals, segment_stats, logs, valid_original_indices
 
     seg_ids = track_df['segment_id'].values
     times_all = track_df['time'].values.astype(float)
@@ -208,7 +207,6 @@ def process_track(track_data, config):
         g_len = end - start
 
         max_outlier_stop = 0.0
-        stop_duration_rejected = False
         if has_outlier_col:
             g_outlier = outlier_all[start:end]
             outlier_ratio = _distance_outlier_ratio(g_tproj, g_outlier, segment_length)
@@ -229,8 +227,7 @@ def process_track(track_data, config):
             if max_outlier_stop > max_outlier_stop_dur:
                 st['invalid'] += 1
                 st['invalid_outlier_stop'] += 1
-                stop_duration_rejected = True
-                # fall through: compute full traversal so pass 2 can recover it
+                continue
 
         if g_len > 1 and (np.diff(g_times) > gap_thresh).any():
             st['invalid'] += 1
@@ -366,17 +363,10 @@ def process_track(track_data, config):
             'traversal_time': traversal_time,
             'segment_length': segment_length
         }
-        if stop_duration_rejected:
-            provisional_traversals.append({
-                'record': record,
-                'max_outlier_stop': float(max_outlier_stop),
-                'orig_indices': g_orig.tolist()
-            })
-        else:
-            traversals.append(record)
-            valid_original_indices.extend(g_orig.tolist())
+        traversals.append(record)
+        valid_original_indices.extend(g_orig.tolist())
 
-    return traversals, segment_stats, logs, valid_original_indices, provisional_traversals
+    return traversals, segment_stats, logs, valid_original_indices
 
 def process_file(csv_path, config):
     out_dir = Path(csv_path).parent
@@ -412,6 +402,53 @@ def process_file(csv_path, config):
         return 0.0, 0.0, 0.0, [], [], [], [], [], [], [], []
 
     logger.info(f"Loaded {len(df)} rows. Time: {time.time() - t0:.2f}s")
+
+    # Detect parked vehicles (stationary for >= 120s)
+    df['is_parked'] = False
+    stopped_thresh = config.get('stopped_speed_threshold', 0.1)
+    parked_thresh = 120.0
+    all_parked_indices = []
+
+    logger.info("Detecting parked vehicles...")
+    t_parked = time.time()
+    
+    for track_id, track_df in df.groupby('track_id'):
+        track_df = track_df.sort_values('time')
+        is_stopped = track_df['speed'].values < stopped_thresh
+        if not is_stopped.any():
+            continue
+            
+        times = track_df['time'].values
+        change_points = np.diff(is_stopped.astype(int))
+        run_starts = np.where(change_points == 1)[0] + 1
+        if is_stopped[0]:
+            run_starts = np.insert(run_starts, 0, 0)
+            
+        run_ends = np.where(change_points == -1)[0]
+        if is_stopped[-1]:
+            run_ends = np.append(run_ends, len(is_stopped) - 1)
+            
+        for start_idx, end_idx in zip(run_starts, run_ends):
+            duration = times[end_idx] - times[start_idx]
+            if duration >= parked_thresh:
+                all_parked_indices.extend(track_df.index[start_idx:end_idx+1].tolist())
+
+    if all_parked_indices:
+        df.loc[all_parked_indices, 'is_parked'] = True
+        logger.info(f"Flagged {len(all_parked_indices)} trajectory points as parked. Time: {time.time() - t_parked:.2f}s")
+    else:
+        logger.info(f"No parked vehicles detected. Time: {time.time() - t_parked:.2f}s")
+
+    # Controller protection diagnostic: report how many points sit near a
+    # controller vs how many are flagged as outliers, as a sanity check.
+    if 'dist_to_controller' in df.columns:
+        near_ctrl = (df['dist_to_controller'] <= config['signal_proximity_threshold']).sum()
+        total_outliers = int(df['is_outlier'].sum()) if 'is_outlier' in df.columns else 0
+        logger.info(
+            f"Controller proximity: {near_ctrl} trajectory points within 5 m "
+            f"of a controller signal; {total_outliers} points flagged as outliers."
+        )
+
     t1 = time.time()
 
     # Load empirical free flow speeds to merge into thresholds
@@ -463,17 +500,15 @@ def process_file(csv_path, config):
     t2 = time.time()
     valid_traversals = []
     all_valid_indices = []
-    provisional_traversals = []
     global_segment_stats = {}
 
     process_func = partial(process_track, config=config)
     with mp.Pool() as pool:
-        for res_traversals, res_stats, res_logs, res_indices, res_provisional in pool.imap_unordered(process_func, grouped):
+        for res_traversals, res_stats, res_logs, res_indices in pool.imap_unordered(process_func, grouped):
             for msg in res_logs:
                 logger.info(msg)
             valid_traversals.extend(res_traversals)
             all_valid_indices.extend(res_indices)
-            provisional_traversals.extend(res_provisional)
             for sid, stats in res_stats.items():
                 if sid not in global_segment_stats:
                     global_segment_stats[sid] = {
@@ -556,19 +591,20 @@ def process_file(csv_path, config):
     logger.info(f"Spline fitting and traversal extraction took {time.time() - t2:.2f}s")
     logger.info(f"Extracted {len(valid_traversals)} valid traversals.")
     
+    if config.get('update_traversals'):
+        if all_valid_indices:
+            logger.info(f"Updating {len(all_valid_indices)} valid trajectory points to is_outlier=False...")
+            df.loc[all_valid_indices, 'is_outlier'] = False
+        updated_csv_path = out_dir / 'matched_trajectories_updated.csv'
+        df.to_csv(updated_csv_path, index=False)
+        logger.info(f"Saved updated trajectories to {updated_csv_path}")
+
     if not valid_traversals:
         logger.info("No valid traversals found.")
         return (0.0, file_avg_ratio, file_avg_stop,
                 list(global_segment_stats.keys()), list(global_segment_stats.keys()),
                 [], [], [], [], [], [])
         
-    if config.get('update_traversals') and all_valid_indices:
-        logger.info(f"Updating {len(all_valid_indices)} valid trajectory points to is_outlier=False...")
-        df.loc[all_valid_indices, 'is_outlier'] = False
-        updated_csv_path = out_dir / 'matched_trajectories_updated.csv'
-        df.to_csv(updated_csv_path, index=False)
-        logger.info(f"Saved updated trajectories to {updated_csv_path}")
-
     traversals_df = pd.DataFrame(valid_traversals)
     
     t3 = time.time()
@@ -622,7 +658,7 @@ def process_file(csv_path, config):
             temp_thresh = -1.0
             spat_thresh = -1.0
             
-        segment_thresholds[int(segment_id)] = {
+        segment_thresholds[str(segment_id)] = {
             'temporal_threshold': temp_thresh,
             'spatial_threshold': spat_thresh,
             'free_flow_speed': free_flow_speed,
@@ -635,10 +671,10 @@ def process_file(csv_path, config):
     # Add segments that only had invalid traversals
     for segment_id, stats in global_segment_stats.items():
         
-        sid_int = int(segment_id)
-        if sid_int not in segment_thresholds:
+        sid_str = str(segment_id)
+        if sid_str not in segment_thresholds:
             logger.info(f"Segment {segment_id} has no valid traversals. Total={stats['total']}  Invalid={stats['invalid']}. Adding with default thresholds.")
-            segment_thresholds[sid_int] = {
+            segment_thresholds[sid_str] = {
                 'temporal_threshold': -1.0,
                 'spatial_threshold': -1.0,
                 'free_flow_speed': -1.0,
@@ -648,42 +684,6 @@ def process_file(csv_path, config):
                 'invalid_traversals': stats['invalid']
             }
 
-    # --- Pass 2: red-light buffer recovery for stop-duration-rejected traversals ---
-    if provisional_traversals:
-        max_outlier_stop_dur = config.get('max_outlier_stop_duration', 5.0)
-        recovered = 0
-        recovered_by_seg = {}
-        recovered_records = []
-        for item in provisional_traversals:
-            rec = item['record']
-            sid_int = int(rec['segment_id'])
-            red_light = segment_thresholds.get(sid_int, {}).get('red_light_duration', 0.0) or 0.0
-            effective_thresh = max_outlier_stop_dur + float(red_light)
-            if item['max_outlier_stop'] <= effective_thresh:
-                recovered_records.append(rec)
-                all_valid_indices.extend(item['orig_indices'])
-                sid_key = rec['segment_id']
-                if sid_key in global_segment_stats:
-                    global_segment_stats[sid_key]['invalid'] = max(0, global_segment_stats[sid_key]['invalid'] - 1)
-                    global_segment_stats[sid_key]['invalid_outlier_stop'] = max(0, global_segment_stats[sid_key]['invalid_outlier_stop'] - 1)
-                if sid_int in segment_thresholds:
-                    segment_thresholds[sid_int]['invalid_traversals'] = max(
-                        0, segment_thresholds[sid_int]['invalid_traversals'] - 1)
-                recovered += 1
-                recovered_by_seg[sid_key] = recovered_by_seg.get(sid_key, 0) + 1
-
-        if recovered_records:
-            traversals_df = pd.concat([traversals_df, pd.DataFrame(recovered_records)], ignore_index=True)
-
-        logger.info(f"\n--- Pass 2: Red-Light Buffer Recovery ---")
-        logger.info(f"Provisional (stop-duration-rejected) traversals: {len(provisional_traversals)}")
-        logger.info(f"Recovered with red-light buffer: {recovered}")
-        if recovered_by_seg:
-            top_recovered = sorted(recovered_by_seg.items(), key=lambda x: x[1], reverse=True)[:10]
-            for sid, cnt in top_recovered:
-                rl = segment_thresholds.get(int(sid), {}).get('red_light_duration', 0.0)
-                logger.info(f"  Segment {sid}: {cnt} recovered (red_light_duration={rl:.2f}s)")
-
     invalid_segments_in_file = []
     low_volume_segments_in_file = []
     high_volume_segments_in_file = []
@@ -691,8 +691,7 @@ def process_file(csv_path, config):
     chain_low_volume_in_file = []
     ps_invalid_in_file = []
     ps_low_volume_in_file = []
-    for sid_int, thresholds in segment_thresholds.items():
-        sid_str = str(sid_int)
+    for sid_str, thresholds in segment_thresholds.items():
         if thresholds['temporal_threshold'] == -1.0 or thresholds['spatial_threshold'] == -1.0:
             invalid_segments_in_file.append(sid_str)
             if sid_str in chain_segment_ids:
@@ -714,7 +713,7 @@ def process_file(csv_path, config):
     if chain_invalid_in_file:
         logger.info(f"[CHAIN - CRITICAL] {len(chain_invalid_in_file)} interior chain segment(s) have invalid thresholds:")
         for sid in sorted(chain_invalid_in_file):
-            stats = segment_thresholds[int(sid)]
+            stats = segment_thresholds[str(sid)]
             rt_tag = ROAD_TYPE_CRITICAL_TAG if sid in primary_secondary_ids else ""
             logger.info(f"  Segment {sid}{rt_tag}: total={stats['total_traversals']} invalid={stats['invalid_traversals']}")
     else:
@@ -722,7 +721,7 @@ def process_file(csv_path, config):
     if chain_low_volume_in_file:
         logger.info(f"[CHAIN - CRITICAL] {len(chain_low_volume_in_file)} interior chain segment(s) have < 10 valid traversals:")
         for sid in sorted(chain_low_volume_in_file):
-            stats = segment_thresholds[int(sid)]
+            stats = segment_thresholds[str(sid)]
             valid_count = stats['total_traversals'] - stats['invalid_traversals']
             rt_tag = ROAD_TYPE_CRITICAL_TAG if sid in primary_secondary_ids else ""
             logger.info(f"  Segment {sid}{rt_tag}: valid={valid_count} total={stats['total_traversals']}")
@@ -733,7 +732,7 @@ def process_file(csv_path, config):
     if ps_invalid_in_file:
         logger.info(f"[PRIMARY/SECONDARY - CRITICAL] {len(ps_invalid_in_file)} primary/secondary segment(s) have invalid thresholds:")
         for sid in sorted(ps_invalid_in_file):
-            stats = segment_thresholds[int(sid)]
+            stats = segment_thresholds[str(sid)]
             chain_tag = CHAIN_CRITICAL_TAG if sid in chain_segment_ids else ""
             logger.info(f"  Segment {sid}{chain_tag}: total={stats['total_traversals']} invalid={stats['invalid_traversals']}")
     else:
@@ -741,7 +740,7 @@ def process_file(csv_path, config):
     if ps_low_volume_in_file:
         logger.info(f"[PRIMARY/SECONDARY - CRITICAL] {len(ps_low_volume_in_file)} primary/secondary segment(s) have < 10 valid traversals:")
         for sid in sorted(ps_low_volume_in_file):
-            stats = segment_thresholds[int(sid)]
+            stats = segment_thresholds[str(sid)]
             valid_count = stats['total_traversals'] - stats['invalid_traversals']
             chain_tag = CHAIN_CRITICAL_TAG if sid in chain_segment_ids else ""
             logger.info(f"  Segment {sid}{chain_tag}: valid={valid_count} total={stats['total_traversals']}")
@@ -761,7 +760,7 @@ def process_file(csv_path, config):
     
     t4 = time.time()
     # RTSM Calculation (vectorized)
-    sid_arr = traversals_df['segment_id'].astype(int).values
+    sid_arr = traversals_df['segment_id'].astype(str).values
     temp_arr = traversals_df['temporal_mean_speed'].values.astype(float)
     spat_arr = traversals_df['spatial_mean_speed'].values.astype(float)
     t_thresh_arr = np.array([segment_thresholds[s]['temporal_threshold'] for s in sid_arr], dtype=float)
@@ -802,8 +801,7 @@ def process_file(csv_path, config):
     logger.info(f"{len(no_rtsm_segment_ids)} segment(s) could not calculate RTSM ({no_rtsm_count} traversals affected).")
     if no_rtsm_segment_ids:
         for sid in sorted(no_rtsm_segment_ids):
-            sid_int = int(sid)
-            stats = segment_thresholds.get(sid_int, {})
+            stats = segment_thresholds.get(str(sid), {})
             chain_tag = CHAIN_CRITICAL_TAG if sid in chain_segment_ids else ""
             rt_tag = ROAD_TYPE_CRITICAL_TAG if sid in primary_secondary_ids else ""
             logger.info(f"  Segment {sid}{chain_tag}{rt_tag}: total={stats.get('total_traversals', 0)} invalid={stats.get('invalid_traversals', 0)}")
@@ -865,6 +863,7 @@ if __name__ == "__main__":
         "percentile_free_flow": 85,
         "max_outlier_proportion": 0.80,
         "max_outlier_stop_duration": 25.0,
+        "signal_proximity_threshold":5.0,
         "update_traversals": args.update_traversals
     }
     

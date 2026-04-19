@@ -151,20 +151,44 @@ global_lanes_map = None
 global_len_map = None
 global_uv_to_seg = None
 global_hw_map = None
+global_seg_to_controller = None
+global_controller_signals = None
 global_config = None
 
 def _map_match_worker_init(gpkg_path, config):
-    global global_map_con, global_edge_data, global_lanes_map, global_len_map, global_uv_to_seg, global_hw_map, global_config
+    global global_map_con, global_edge_data, global_lanes_map, global_len_map
+    global global_uv_to_seg, global_hw_map, global_seg_to_controller
+    global global_controller_signals, global_config
     global_config = config
-    
+
     edges_gdf = gpd.read_file(gpkg_path)
     global_map_con = get_osm_map(edges_gdf)
-    
+
     global_edge_data = {}
     global_lanes_map = {}
     global_len_map = {}
     global_uv_to_seg = {}
     global_hw_map = {}
+
+    # Load controller data for controller-aware outlier protection
+    global_seg_to_controller = {}
+    global_controller_signals = {}
+    controllers_path = os.path.join(os.path.dirname(gpkg_path) or '.', 'controllers.json')
+    if os.path.exists(controllers_path):
+        with open(controllers_path, 'r') as f:
+            controllers = json.load(f)
+        for ctrl_id, ctrl in controllers.items():
+            sig_pts = np.array(
+                [[s['x_utm'], s['y_utm']] for s in ctrl.get('raw_osm_signals', [])],
+                dtype=float
+            ).reshape(-1, 2) if ctrl.get('raw_osm_signals') else np.empty((0, 2), dtype=float)
+            global_controller_signals[ctrl_id] = sig_pts
+            for sid in ctrl.get('approach_segments', []):
+                global_seg_to_controller[sid] = ctrl_id
+            for sid in ctrl.get('junction_segments', []):
+                if sid not in global_seg_to_controller:
+                    global_seg_to_controller[sid] = ctrl_id
+
     for row in edges_gdf.itertuples():
         key = (int(row.u), int(row.v))
         try:
@@ -177,7 +201,7 @@ def _map_match_worker_init(gpkg_path, config):
         global_len_map[key] = float(row.length)
         global_uv_to_seg[key] = str(row.segment_id)
         global_hw_map[key] = str(row.highway)
-        
+
         coords = np.array(row.geometry.coords)
         if len(coords) < 2:
             continue
@@ -252,48 +276,63 @@ def _map_match_track(track_tuple):
     rel_headings = np.zeros(len(group_results))
     highways_list = np.empty(len(group_results), dtype=object)
     t_projs = np.zeros(len(group_results))
-    
+    controller_id_list = np.empty(len(group_results), dtype=object)
+    dist_to_controller_list = np.full(len(group_results), np.inf)
+
     for key, indices in edge_groups.items():
         if key not in global_edge_data:
             for idx in indices:
                 segment_ids[idx] = ""
                 highways_list[idx] = ""
+                controller_id_list[idx] = ""
             continue
-            
+
         ed = global_edge_data[key]
         a, ab = ed['a'], ed['ab']
         sub_l2, sub_l, accum_l = ed['sub_l2'], ed['sub_l'], ed['accum_l']
         valid, az_sub = ed['valid'], ed['az_sub']
-        
+
         total_l = global_len_map.get(key, accum_l[-1] + sub_l[-1] if len(accum_l) > 0 else 1.0)
         if total_l <= 0.0: total_l = 1.0
-        
+
         seg_id = global_uv_to_seg.get(key, str(key))
         n_lanes = global_lanes_map.get(key, 2)
         hw = global_hw_map.get(key, "unknown")
-        
+
+        # Controller-aware signal proximity
+        ctrl_id = global_seg_to_controller.get(seg_id, "")
+        ctrl_signals = global_controller_signals.get(ctrl_id) if ctrl_id else None
+
         # Vectorized Projections
-        p = np.column_stack((x_vals[indices], y_vals[indices])) 
-        ap = p[:, np.newaxis, :] - a[np.newaxis, :, :] 
+        p = np.column_stack((x_vals[indices], y_vals[indices]))
+        ap = p[:, np.newaxis, :] - a[np.newaxis, :, :]
         dot_ap_ab = ap[:, :, 0] * ab[:, 0] + ap[:, :, 1] * ab[:, 1]
-        
+
         t = np.zeros_like(dot_ap_ab)
         t[:, valid] = np.clip(dot_ap_ab[:, valid] / sub_l2[valid], 0, 1)
-        
+
         proj = a[np.newaxis, :, :] + t[:, :, np.newaxis] * ab[np.newaxis, :, :]
         diff = p[:, np.newaxis, :] - proj
         dists = np.sqrt(diff[:, :, 0]**2 + diff[:, :, 1]**2)
-        
-        best_idx = np.argmin(dists, axis=1) 
+
+        best_idx = np.argmin(dists, axis=1)
         row_idx = np.arange(len(indices))
         best_dist = dists[row_idx, best_idx]
-        
+
         cross = ab[best_idx, 0] * ap[row_idx, best_idx, 1] - ab[best_idx, 1] * ap[row_idx, best_idx, 0]
         signed_d = best_dist * np.where(cross > 0, -1, 1)
-        
+
         dist_along = accum_l[best_idx] + t[row_idx, best_idx] * sub_l[best_idx]
         rel_h = np.abs((azcar_vals[indices] - az_sub[best_idx] + 180) % 360 - 180)
-        
+
+        # Euclidean distance from each point to the nearest raw signal of
+        # the controller this segment belongs to.
+        if ctrl_signals is not None and ctrl_signals.shape[0] > 0:
+            diffs_ctrl = p[:, np.newaxis, :] - ctrl_signals[np.newaxis, :, :]
+            ctrl_dists = np.sqrt(diffs_ctrl[:, :, 0]**2 + diffs_ctrl[:, :, 1]**2).min(axis=1)
+        else:
+            ctrl_dists = np.full(len(indices), np.inf)
+
         for i, idx in enumerate(indices):
             signed_distances[idx] = signed_d[i]
             segment_ids[idx] = seg_id
@@ -303,7 +342,9 @@ def _map_match_track(track_tuple):
             highways_list[idx] = hw
             t_projs[idx] = dist_along[i]
             rel_headings[idx] = rel_h[i]
-            
+            controller_id_list[idx] = ctrl_id
+            dist_to_controller_list[idx] = ctrl_dists[i]
+
     group_results['signed_dist'] = signed_distances
     group_results['segment_id'] = segment_ids
     group_results['num_lanes'] = num_lanes_list
@@ -312,6 +353,8 @@ def _map_match_track(track_tuple):
     group_results['rel_heading'] = rel_headings
     group_results['highway'] = highways_list
     group_results['t_proj'] = t_projs
+    group_results['controller_id'] = controller_id_list
+    group_results['dist_to_controller'] = dist_to_controller_list
     
     group_results = group_results[group_results['rel_heading'] <= global_config["rel_heading_limit"]].copy()
     
@@ -615,9 +658,18 @@ def calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logge
         if not mask.any(): continue
             
         raw_indices = np.digitize(df.loc[mask, 'D'], bins=bounds)
-        
+
         # Identify outliers (indices 0 for < bounds[0] or len(bounds) for >= bounds[-1])
         seg_outliers = (raw_indices == 0) | (raw_indices == len(bounds))
+
+        # Protect points near a traffic-signal controller. dist_to_controller is
+        # the Euclidean distance from this point to the nearest raw signal of the
+        # controller the matched segment belongs to; inf if no controller.
+        if 'dist_to_controller' in df.columns:
+            seg_ctrl_dist = df.loc[mask, 'dist_to_controller'].values
+            near_controller = seg_ctrl_dist <= config["signal_proximity_threshold"]
+            seg_outliers = seg_outliers & (~near_controller)
+
         df.loc[df[mask].index[seg_outliers], 'is_outlier'] = True
         
         # Map valid points to 0-based lane indices (clipping here just avoids OutOfBounds errors before removal)
@@ -854,6 +906,27 @@ def process_single_file(input_file, edges_gdf, network_path, args, config, globa
     filtered_edges = edges_gdf[edges_gdf['segment_id'].astype(str).isin(valid_segments)]
     filtered_edges.to_file(filtered_network_path, driver='GPKG')
 
+    # Filter and export controllers.json
+    controllers_path = os.path.join(os.path.dirname(network_path) or '.', 'controllers.json')
+    if os.path.exists(controllers_path):
+        with open(controllers_path, 'r') as f:
+            controllers = json.load(f)
+            
+        filtered_controllers = {}
+        for cid, ctrl in controllers.items():
+            valid_approaches = [s for s in ctrl.get('approach_segments', []) if str(s) in valid_segments_set]
+            if not valid_approaches:
+                continue
+                
+            ctrl['approach_segments'] = valid_approaches
+            ctrl['junction_segments'] = [s for s in ctrl.get('junction_segments', []) if str(s) in valid_segments_set]
+            filtered_controllers[cid] = ctrl
+            
+        filtered_controllers_path = os.path.join(output_dir, 'controllers.json')
+        logger.info(f"Exporting filtered controllers ({len(filtered_controllers)}/{len(controllers)}) to {filtered_controllers_path}...")
+        with open(filtered_controllers_path, 'w') as f:
+            json.dump(filtered_controllers, f, indent=4)
+
     df, detected_lanes = calculate_signed_distance_and_lanes(df, edges_gdf, output_dir, config, logger, test=args.test)
     empirical_speeds = calculate_empirical_speeds(df, edges_gdf, output_dir, config, logger)
     
@@ -920,7 +993,8 @@ def main():
         "min_lane_width_strict": 1.75,
         "max_lane_width": 4.5,
         "default_speeds": {'primary': 14.0, 'secondary': 11.0, 'tertiary': 9.0, 'trunk': 20.0, 'residential': 8.0, 'unclassified': 8.0},
-        "default_speed_fallback": 10.0
+        "default_speed_fallback": 10.0,
+        "signal_proximity_threshold": 5.0
     }
     
     os.makedirs("processed_data", exist_ok=True)
