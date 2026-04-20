@@ -29,7 +29,7 @@ def compute_tema_for_segment(segment_id, seg_df, segment_thresholds, tau=30.0):
     if len(seg_df) == 0:
         return pd.DataFrame()
         
-    thresh = segment_thresholds.get(str(int(segment_id))) or segment_thresholds.get(int(segment_id))
+    thresh = segment_thresholds.get(str(segment_id))
     if not thresh:
         # Fallback if no thresholds found
         temp_thresh, spat_thresh = 0.0, 0.0

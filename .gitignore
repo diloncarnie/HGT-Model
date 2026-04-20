@@ -14,4 +14,4 @@
 extract_map_and_speeds.py
 *.log
 /removed_*
-.bat
+*.bat

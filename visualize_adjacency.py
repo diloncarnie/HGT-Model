@@ -99,7 +99,7 @@ def visualize_adjacency(network_file, adjacency_file):
         adjacency = json.load(f)
 
     # Load controllers for controller-aware visualization
-    controllers_path = os.path.join(os.path.dirname(network_file) or '.', 'controllers.json')
+    controllers_path = os.path.join(os.path.dirname(adjacency_file) or '.', 'controllers.json')
     controllers = {}
     if os.path.exists(controllers_path):
         with open(controllers_path, 'r') as f:
@@ -140,6 +140,7 @@ def visualize_adjacency(network_file, adjacency_file):
     edges['merges_into_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'merges_into'))
     edges['u_turns_into_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'u_turns_into'))
     edges['crosses_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'crosses'))
+    edges['intersects_with_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'intersects_with'))
     edges['opposite_direction_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'opposite_direction'))
     edges['banned_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'banned_successors'))
     edges['only_successors_info'] = edges['segment_id_str'].apply(lambda x: get_adj_summary(x, 'only_successors'))
@@ -509,7 +510,7 @@ def visualize_adjacency(network_file, adjacency_file):
 
         function highlightNeighbors(egoId, plotEl) {{
             var egoIdStr = String(egoId);
-            var adj = adjacency[egoIdStr] || {{to: [], from: [], merges_into: [], crossed_by: [], turns_into: [], u_turns_into: [], crosses: [], opposite_direction: [], banned_successors: [], only_successors: [], merges_with: [], merged_by: []}};
+            var adj = adjacency[egoIdStr] || {{to: [], from: [], merges_into: [], crossed_by: [], turns_into: [], u_turns_into: [], crosses: [], intersects_with: [], opposite_direction: [], banned_successors: [], only_successors: [], merges_with: [], merged_by: []}};
             
             // Update OSM Links in the control bar
             var osmids = osmidMap[egoIdStr];
@@ -706,7 +707,21 @@ def visualize_adjacency(network_file, adjacency_file):
                 }}
             }});
 
-            // 11. Merges With (Yellow)
+            // 11. Intersects With (Deep Red)
+            (adj.intersects_with || []).forEach(sid => {{
+                if (geoMap[sid]) {{
+                    traces.push({{
+                        type: 'scattermap',
+                        lat: geoMap[sid].map(p => p[0]),
+                        lon: geoMap[sid].map(p => p[1]),
+                        mode: 'lines',
+                        line: {{width: 6, color: 'darkred'}},
+                        name: egoIdStr + ' intersects_with ' + sid
+                    }});
+                }}
+            }});
+
+            // 12. Merges With (Yellow)
             (adj.merges_with || []).forEach(sid => {{
                 if (geoMap[sid]) {{
                     traces.push({{
@@ -720,7 +735,7 @@ def visualize_adjacency(network_file, adjacency_file):
                 }}
             }});
 
-            // 12. Merged By (Pink)
+            // 13. Merged By (Pink)
             (adj.merged_by || []).forEach(sid => {{
                 if (geoMap[sid]) {{
                     traces.push({{

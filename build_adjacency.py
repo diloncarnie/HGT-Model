@@ -1337,6 +1337,9 @@ def split_multi_signal_segments(edges, adjacency, config):
                 if sid in other_adj.get('crossed_by', []):
                     idx_cb = other_adj['crossed_by'].index(sid)
                     other_adj['crossed_by'][idx_cb] = sid_a
+                if sid in other_adj.get('intersects_with', []):
+                    idx_iw = other_adj['intersects_with'].index(sid)
+                    other_adj['intersects_with'][idx_iw] = sid_a
 
             del adjacency[sid]
 
@@ -1516,6 +1519,46 @@ def _dedupe_crosses_against_merges(adjacency):
                 kept_lens.append(ln)
             data[rel] = kept_ids
             data[len_key] = kept_lens
+
+def _extract_mutual_intersections(adjacency):
+    """Identify when an ego road segment crosses and is crossed_by the same segment.
+    Move these mutual crossings into a new 'intersects_with' relationship.
+    """
+    for data in adjacency.values():
+        if 'intersects_with' not in data:
+            data['intersects_with'] = []
+            data['intersects_with_lengths'] = []
+            
+        crosses = data.get('crosses', [])
+        crossed_by = data.get('crossed_by', [])
+        mutual = set(crosses).intersection(set(crossed_by))
+        
+        if not mutual:
+            continue
+            
+        new_crosses = []
+        new_crosses_len = []
+        for c_id, c_len in zip(crosses, data.get('crosses_lengths', [])):
+            if c_id in mutual:
+                if c_id not in data['intersects_with']:
+                    data['intersects_with'].append(c_id)
+                    data['intersects_with_lengths'].append(c_len)
+            else:
+                new_crosses.append(c_id)
+                new_crosses_len.append(c_len)
+                
+        data['crosses'] = new_crosses
+        data['crosses_lengths'] = new_crosses_len
+        
+        new_crossed_by = []
+        new_crossed_by_len = []
+        for cb_id, cb_len in zip(crossed_by, data.get('crossed_by_lengths', [])):
+            if cb_id not in mutual:
+                new_crossed_by.append(cb_id)
+                new_crossed_by_len.append(cb_len)
+                
+        data['crossed_by'] = new_crossed_by
+        data['crossed_by_lengths'] = new_crossed_by_len
 
 
 def build_topological_adjacency(edges_gdf, config):
@@ -1868,6 +1911,7 @@ def build_topological_adjacency(edges_gdf, config):
             'turns_into': filtered_intersects_out,
             'u_turns_into': u_turns,
             'crosses': crosses,
+            'intersects_with': [],
             'banned_successors': banned_successors,
             'only_successors': only_successors,
             'opposite_direction': opposite_direction,
@@ -1880,6 +1924,7 @@ def build_topological_adjacency(edges_gdf, config):
             'turns_into_lengths': [segment_data[sid]['length'] for sid in filtered_intersects_out],
             'u_turns_into_lengths': [segment_data[sid]['length'] for sid in u_turns],
             'crosses_lengths': [segment_data[sid]['length'] for sid in crosses],
+            'intersects_with_lengths': [],
             'opposite_direction_lengths': [segment_data[sid]['length'] for sid in opposite_direction],
             'merges_with_lengths': [],
             'merged_by_lengths': [],
@@ -1964,6 +2009,7 @@ def build_topological_adjacency(edges_gdf, config):
     # a pair with a shared-successor merge relationship should not also be marked
     # as crossing. The merge relationship is the more specific topological fact.
     _dedupe_crosses_against_merges(adjacency)
+    _extract_mutual_intersections(adjacency)
 
     return adjacency, restrictions
 
@@ -2161,7 +2207,7 @@ def merge_short_segments(gdf, adj, config):
         if not shape_mode:
             # Standalone mode: skip if any connected neighbor is itself a junction.
             connected_sids = set()
-            for rel in ['turns_into', 'merges_into', 'u_turns_into', 'crosses', 'crossed_by']:
+            for rel in ['turns_into', 'merges_into', 'u_turns_into', 'crosses', 'crossed_by', 'intersects_with']:
                 connected_sids.update(s_adj.get(rel, []))
             if s_adj.get('to'):
                 connected_sids.add(str(s_adj.get('to')[0]))
@@ -2319,6 +2365,7 @@ def merge_junction_pairs(gdf, adj, config):
             if not a_adj:
                 continue
             if (a_adj.get('crossed_by') or a_adj.get('crosses')
+                    or a_adj.get('intersects_with')
                     or a_adj.get('turns_into') or a_adj.get('merges_into')
                     or a_adj.get('u_turns_into')):
                 continue
@@ -3020,6 +3067,7 @@ def propagate_junction_topology(adjacency, edges_gdf, restrictions, config):
     # Same mutual-exclusion rule as in the initial build: drop any crosses/
     # crossed_by entries that are already captured by merges_with/merged_by.
     _dedupe_crosses_against_merges(adjacency)
+    _extract_mutual_intersections(adjacency)
 
     junctions_logger.info(
         f"Junction propagation complete: rewired {sum(len(v) for v in additions.values())} "
@@ -3139,8 +3187,10 @@ def simplify_network_topology(gdf, adj):
                 if len_key in adj[absorber]:
                     adj[keeper][len_key] = adj[absorber][len_key]
                     
-            for rel in ['crosses', 'crossed_by']:
-                len_key = rel + '_lengths' if rel == 'crossed_by' else 'crosses_lengths'
+            for rel in ['crosses', 'crossed_by', 'intersects_with']:
+                if rel == 'crossed_by': len_key = 'crossed_by_lengths'
+                elif rel == 'crosses': len_key = 'crosses_lengths'
+                else: len_key = 'intersects_with_lengths'
                 existing = set(adj[keeper].get(rel, []))
                 for i, item in enumerate(adj[absorber].get(rel, [])):
                     if item not in existing:
@@ -3163,8 +3213,10 @@ def simplify_network_topology(gdf, adj):
             if 'merged_by_lengths' in adj[absorber]:
                 adj[keeper]['merged_by_lengths'] = adj[absorber]['merged_by_lengths']
                 
-            for rel in ['crosses', 'crossed_by']:
-                len_key = rel + '_lengths' if rel == 'crossed_by' else 'crosses_lengths'
+            for rel in ['crosses', 'crossed_by', 'intersects_with']:
+                if rel == 'crossed_by': len_key = 'crossed_by_lengths'
+                elif rel == 'crosses': len_key = 'crosses_lengths'
+                else: len_key = 'intersects_with_lengths'
                 existing = set(adj[keeper].get(rel, []))
                 for i, item in enumerate(adj[absorber].get(rel, [])):
                     if item not in existing:
@@ -3187,6 +3239,7 @@ def simplify_network_topology(gdf, adj):
                     len_key = key + '_lengths' if not key.endswith('s') else key[:-1] + '_lengths'
                     if key == 'crosses': len_key = 'crosses_lengths'
                     if key == 'crossed_by': len_key = 'crossed_by_lengths'
+                    if key == 'intersects_with': len_key = 'intersects_with_lengths'
                     
                     has_lens = len_key in data and len(data[len_key]) == len(val_list)
                     
