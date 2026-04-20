@@ -6,7 +6,6 @@
 /pNEUMA_dataset
 /previous_network
 *.pdf
-*.md
 *.csv
 *.gpkg
 *.json
@@ -15,3 +14,6 @@ extract_map_and_speeds.py
 *.log
 /removed_*
 *.bat
+build_adjacency.md
+pipeline.md
+signal_controllers.md
